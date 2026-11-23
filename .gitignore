@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local secrets & runtime data
+.env
+.env.*
+!.env.example
+data/
+models/
+deploy/certs/
+
+# Sample media & generated outputs
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.flac
+*.ogg
+*.amr
+*.webm
+*.srt
+*.vtt
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
