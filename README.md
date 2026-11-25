@@ -179,3 +179,9 @@ print(res.segments)
 pip install -r requirements-dev.txt
 pytest -v
 ```
+
+---
+
+## License
+
+本项目采用 [MIT License](LICENSE) 开源。模型权重与推理引擎请分别遵循 Qwen3-ASR 及相关上游项目的许可协议。

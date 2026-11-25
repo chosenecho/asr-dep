@@ -1,6 +1,6 @@
 # API 参考文档
 
-本文档描述 Qwen3-ASR-1.7B 长录音转写服务的全部 HTTP 接口、参数约定、返回结构与错误码。服务启动后亦可直接访问 FastAPI 自动生成的交互式文档：`http://<HOST>:<PORT>/docs`（Swagger UI）与 `/redoc`。
+本文档描述 `qwen3-asr-server`（Qwen3-ASR-1.7B + Qwen3-ForcedAligner-0.6B 长录音转写服务）的全部 HTTP 接口、参数约定、返回结构与错误码。服务启动后亦可直接访问 FastAPI 自动生成的交互式文档：`http://<HOST>:<PORT>/docs`（Swagger UI）与 `/redoc`。
 
 ---
 
@@ -106,7 +106,7 @@ X-API-Key: <API_KEY>
 | `file` | `file` | 是 | - | 音视频文件（ffmpeg 支持的格式，如 mp3/m4a/wav/flac/ogg/amr/mp4/webm） |
 | `language` | `string` | 否 | `null` | 语言名称或 ISO 代码（如 `Chinese` / `zh` / `en`），留空或 `auto` 自动检测 |
 | `context` | `string` | 否 | `""` | 领域热词或上下文提示（如人名、专有名词，逗号或空格分隔） |
-| `return_timestamps` | `bool` | 否 | `true` | 是否启用 `Qwen3-ForcedAligner-0.6B` 输出时间戳 |
+| `return_timestamps` | `bool` | 否 | `true` | 是否启用 `Qwen3-ForcedAligner-0.6B` 输出时间戳（设为 `false` 时同步跳过后台对齐梅尔特征预计算，速度更快） |
 | `include_words` | `bool` | 否 | `true` | 响应中是否包含字/词级 `words` 列表（关闭可减小 JSON 体积） |
 | `webhook_url` | `string` | 否 | `null` | 任务完成或失败后接收 JSON 回调的 `http(s)` URL（禁止回环与内网地址） |
 
