@@ -190,3 +190,42 @@ def test_sync_and_openai_compatible_endpoints(api_client: TestClient) -> None:
     )
     assert guard_resp.status_code == 400
     assert "/v1/asr/tasks" in guard_resp.json()["detail"]
+
+
+def test_concurrent_long_audio_tasks_round_robin_and_coalescing(api_client: TestClient) -> None:
+    key = next(iter(api_client.app.state.settings.api_key_set))
+    headers = {"Authorization": f"Bearer {key}"}
+    wav_bytes = _make_wav_bytes(35.0)
+
+    # Submit 4 concurrent async jobs with mixed languages and timestamp flags
+    specs = [("zh", "true"), ("en", "true"), ("zh", "false"), ("en", "true")]
+    task_ids = []
+    for idx, (lang, ret_ts) in enumerate(specs):
+        resp = api_client.post(
+            "/v1/asr/tasks",
+            headers=headers,
+            files={"file": (f"job_{idx}.wav", wav_bytes, "audio/wav")},
+            data={"language": lang, "return_timestamps": ret_ts, "include_words": ret_ts},
+        )
+        assert resp.status_code == 202
+        task_ids.append((resp.json()["task_id"], lang, ret_ts == "true"))
+
+    for tid, lang, expect_ts in task_ids:
+        final = None
+        for _ in range(80):
+            poll = api_client.get(f"/v1/asr/tasks/{tid}", headers=headers)
+            assert poll.status_code == 200
+            data = poll.json()
+            if data["status"] in ("completed", "failed"):
+                final = data
+                break
+            time.sleep(0.05)
+        assert final is not None
+        assert final["status"] == "completed", final.get("error")
+        res = final["result"]
+        assert res["language"] == ("Chinese" if lang == "zh" else "English")
+        assert len(res["segments"]) >= 3
+        if expect_ts:
+            assert len(res["words"]) > 0
+        else:
+            assert res.get("words") is None

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
+import math
 import multiprocessing as mp
 import queue
 import threading
@@ -11,7 +13,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -48,7 +50,22 @@ class DualGPUDispatcher:
         self._stop_event = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._job_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
+        self._decode_semaphore = asyncio.Semaphore(settings.max_concurrent_decodes)
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._job_ring: Deque[str] = deque()
+        self._job_queues: Dict[
+            str, Deque[Tuple[Dict[str, Any], asyncio.Future[Dict[str, Any]]]]
+        ] = {}
+        self._inflight_count: int = 0
+        batches_per_super = max(
+            1,
+            math.ceil(
+                settings.max_inference_batch_size / max(1, settings.chunks_per_dispatch)
+            ),
+        )
+        self._max_queued_batches: int = max(
+            4, len(settings.gpu_id_list) * batches_per_super * 2
+        )
         self._started = False
 
     async def start(self) -> None:
@@ -78,11 +95,14 @@ class DualGPUDispatcher:
         for gpu_id in gpu_ids:
             worker_cfg = {
                 "gpu_id": gpu_id,
+                "num_workers": len(gpu_ids),
                 "asr_backend": self.settings.asr_backend,
                 "asr_model_path": self.settings.asr_model_path,
                 "aligner_model_path": self.settings.aligner_model_path,
                 "gpu_memory_utilization": self.settings.gpu_memory_utilization,
                 "max_inference_batch_size": self.settings.max_inference_batch_size,
+                "aligner_batch_size": self.settings.aligner_batch_size,
+                "batch_coalesce_wait_ms": self.settings.batch_coalesce_wait_ms,
                 "max_new_tokens": self.settings.max_new_tokens,
                 "use_flash_attention": self.settings.use_flash_attention,
                 "log_level": self.settings.log_level,
@@ -180,7 +200,51 @@ class DualGPUDispatcher:
                     )
             self._pending.clear()
 
+        for q in self._job_queues.values():
+            for _, fut in q:
+                if not fut.done():
+                    fut.set_exception(RuntimeError("Dispatcher shut down."))
+        self._job_queues.clear()
+        self._job_ring.clear()
+        self._inflight_count = 0
+
         self._started = False
+
+    def _resolve_batch_future(
+        self,
+        fut: asyncio.Future[Dict[str, Any]],
+        res: Dict[str, Any],
+    ) -> None:
+        self._inflight_count = max(0, self._inflight_count - 1)
+        if not fut.done():
+            fut.set_result(res)
+        self._pump_scheduler()
+
+    def _pump_scheduler(self) -> None:
+        """Feed mini-batches into the GPU work_queue in strict round-robin across active jobs."""
+        if not self._started or self._work_queue is None:
+            return
+        while self._inflight_count < self._max_queued_batches and self._job_ring:
+            job_id = self._job_ring.popleft()
+            q = self._job_queues.get(job_id)
+            if not q:
+                self._job_queues.pop(job_id, None)
+                continue
+
+            payload, fut = q.popleft()
+            if q:
+                self._job_ring.append(job_id)
+            else:
+                self._job_queues.pop(job_id, None)
+
+            if fut.done() or fut.cancelled():
+                continue
+
+            batch_id = payload["batch_id"]
+            with self._pending_lock:
+                self._pending[batch_id] = fut
+            self._inflight_count += 1
+            self._work_queue.put(payload)
 
     def _result_reader_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -194,8 +258,8 @@ class DualGPUDispatcher:
             batch_id = res.get("batch_id")
             with self._pending_lock:
                 fut = self._pending.pop(batch_id, None)
-            if fut is not None and not fut.done() and self._loop is not None:
-                self._loop.call_soon_threadsafe(fut.set_result, res)
+            if fut is not None and self._loop is not None:
+                self._loop.call_soon_threadsafe(self._resolve_batch_future, fut, res)
 
     def health_info(self) -> Dict[str, Any]:
         workers = []
@@ -207,13 +271,14 @@ class DualGPUDispatcher:
             workers.append({"gpu_id": gid, "pid": proc.pid, "alive": alive})
         with self._pending_lock:
             inflight_batches = len(self._pending)
+        queued_batches = sum(len(q) for q in self._job_queues.values())
         return {
             "status": "ok" if (self._started and alive_count == len(self._workers) and alive_count > 0) else "degraded",
             "backend": self.settings.asr_backend,
             "model": self.settings.served_model_name,
             "aligner_enabled": bool((self.settings.aligner_model_path or "").strip()),
             "workers": workers,
-            "inflight_batches": inflight_batches,
+            "inflight_batches": inflight_batches + queued_batches,
             "active_background_jobs": len(self._background_tasks),
         }
 
@@ -273,6 +338,8 @@ class DualGPUDispatcher:
             self.settings.chunk_strategy,
             self.settings.vad_threshold,
             self.settings.vad_min_silence_ms,
+            None,
+            self.settings.vad_max_workers,
         )
         total_chunks = len(chunks)
         if total_chunks == 0:
@@ -286,39 +353,58 @@ class DualGPUDispatcher:
                 "words": [] if include_words else None,
             }
 
+        if not self._started or self._loop is None:
+            raise RuntimeError("Dispatcher is not running.")
+
         if on_progress:
             on_progress(0, total_chunks)
 
-        # Group chunks into mini-batches so BOTH RTX 4090 GPUs share long audio work in parallel.
+        # Enqueue mini-batches into the fair round-robin scheduler so concurrent multi-hour
+        # recordings interleave smoothly and GPU workers coalesce chunks into full super-batches.
         step = self.settings.chunks_per_dispatch
-        batch_tasks = [
-            asyncio.create_task(
-                self._submit_chunk_batch(
-                    wav_path=wav_path,
-                    chunks=chunks[i : i + step],
-                    language=language,
-                    context=context,
-                    return_timestamps=return_timestamps,
-                )
-            )
-            for i in range(0, total_chunks, step)
-        ]
+        job_id = uuid.uuid4().hex
+        job_q: Deque[Tuple[Dict[str, Any], asyncio.Future[Dict[str, Any]]]] = deque()
+        batch_futures: List[asyncio.Future[Dict[str, Any]]] = []
+        for i in range(0, total_chunks, step):
+            batch_id = uuid.uuid4().hex
+            fut: asyncio.Future[Dict[str, Any]] = self._loop.create_future()
+            payload = {
+                "batch_id": batch_id,
+                "wav_path": str(wav_path),
+                "chunks": [asdict(c) for c in chunks[i : i + step]],
+                "language": language,
+                "context": context,
+                "return_timestamps": return_timestamps,
+            }
+            job_q.append((payload, fut))
+            batch_futures.append(fut)
+
+        self._job_queues[job_id] = job_q
+        self._job_ring.append(job_id)
+        self._pump_scheduler()
 
         collected: List[Dict[str, Any]] = []
         completed_chunks = 0
         try:
-            for finished in asyncio.as_completed(batch_tasks):
+            for finished in asyncio.as_completed(batch_futures):
                 batch_res = await finished
+                if not batch_res.get("ok"):
+                    raise RuntimeError(
+                        f"GPU worker {batch_res.get('gpu_id')} failed: {batch_res.get('error', 'unknown error')}"
+                    )
                 chunk_list = batch_res["chunks"]
                 collected.extend(chunk_list)
                 completed_chunks += len(chunk_list)
                 if on_progress:
                     on_progress(completed_chunks, total_chunks)
         except Exception:
-            for t in batch_tasks:
-                t.cancel()
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+            self._job_queues.pop(job_id, None)
+            for fut in batch_futures:
+                if not fut.done():
+                    fut.cancel()
             raise
+        finally:
+            self._job_queues.pop(job_id, None)
 
         collected.sort(key=lambda x: int(x["chunk_index"]))
 
@@ -418,7 +504,8 @@ class DualGPUDispatcher:
         try:
             async with self._job_semaphore:
                 self.store.update_status(task_id, status="decoding", progress=0.02)
-                duration_sec = await decode_to_wav_16k(raw_audio_path, wav_path)
+                async with self._decode_semaphore:
+                    duration_sec = await decode_to_wav_16k(raw_audio_path, wav_path)
                 self.store.update_status(
                     task_id,
                     status="processing",

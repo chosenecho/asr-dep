@@ -21,6 +21,7 @@ from app.audio import (
     compute_low_energy_chunks,
     normalize_for_vad,
     read_chunk_waveform,
+    read_chunks_from_wav,
 )
 from app.worker import normalize_requested_language
 
@@ -116,6 +117,24 @@ def test_read_chunk_waveform_pads_short_tail(tmp_path: Path) -> None:
     wav, sr = read_chunk_waveform(wav_path, 0, 1600, min_sec=0.5)
     assert sr == SAMPLE_RATE
     assert wav.shape[0] == int(0.5 * SAMPLE_RATE)
+
+
+def test_read_chunks_from_wav_matches_single_reads(tmp_path: Path) -> None:
+    wav_path = tmp_path / "multi.wav"
+    t = np.arange(SAMPLE_RATE * 4, dtype=np.float32) / SAMPLE_RATE
+    sig = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    sf.write(str(wav_path), sig, SAMPLE_RATE, subtype="PCM_16")
+
+    specs = [
+        {"start_frame": 0, "end_frame": SAMPLE_RATE * 2},
+        {"start_frame": SAMPLE_RATE * 2, "end_frame": SAMPLE_RATE * 4},
+    ]
+    batch = read_chunks_from_wav(wav_path, specs)
+    assert len(batch) == 2
+    for sp, (arr, sr) in zip(specs, batch):
+        ref, ref_sr = read_chunk_waveform(wav_path, sp["start_frame"], sp["end_frame"])
+        assert sr == ref_sr == SAMPLE_RATE
+        assert np.allclose(arr, ref)
 
 
 def test_build_segments_chinese_punctuation_and_words() -> None:

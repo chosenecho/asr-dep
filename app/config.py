@@ -60,10 +60,16 @@ class Settings(BaseSettings):
         description="vLLM GPU memory utilization per 4090 (leave ~5-6GB for ForcedAligner)",
     )
     max_inference_batch_size: int = Field(
-        default=8,
+        default=16,
         ge=1,
         le=128,
-        description="Max chunks per inference batch inside each GPU worker",
+        description="Max chunks per vLLM ASR inference batch inside each GPU worker (supports cross-job coalescing)",
+    )
+    aligner_batch_size: int = Field(
+        default=6,
+        ge=1,
+        le=64,
+        description="Max chunks per ForcedAligner GPU forward pass (decoupled from ASR batch size to prevent OOM)",
     )
     max_new_tokens: int = Field(
         default=2048,
@@ -72,10 +78,16 @@ class Settings(BaseSettings):
         description="Max generated tokens per audio chunk (2048 comfortably covers 120-150s speech)",
     )
     chunks_per_dispatch: int = Field(
-        default=4,
+        default=6,
         ge=1,
         le=32,
-        description="Number of chunks dispatched as one work unit to a GPU worker",
+        description="Number of chunks per fair-scheduled work unit dispatched from each job",
+    )
+    batch_coalesce_wait_ms: int = Field(
+        default=15,
+        ge=0,
+        le=500,
+        description="Max milliseconds a GPU worker waits to coalesce queued chunks across jobs into a super-batch",
     )
     use_flash_attention: bool = Field(
         default=False,
@@ -116,6 +128,18 @@ class Settings(BaseSettings):
         le=2000,
         description="Minimum non-speech pause duration (ms) preferred for Silero VAD boundary snapping",
     )
+    vad_max_workers: int = Field(
+        default=6,
+        ge=1,
+        le=32,
+        description="Max CPU threads for parallel lock-free Silero VAD boundary search",
+    )
+    max_concurrent_decodes: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description="Max concurrent ffmpeg audio decoding subprocesses",
+    )
     max_upload_size_mb: int = Field(
         default=500,
         ge=1,
@@ -137,6 +161,10 @@ class Settings(BaseSettings):
     data_dir: Path = Field(
         default=Path("./data"),
         description="Directory for SQLite database and temporary audio staging",
+    )
+    temp_dir: str = Field(
+        default="",
+        description="Optional override directory for temporary audio WAV files (e.g. /dev/shm/qwen3_asr_tmp)",
     )
     task_retention_hours: int = Field(
         default=72,
@@ -169,6 +197,8 @@ class Settings(BaseSettings):
 
     @property
     def temp_audio_dir(self) -> Path:
+        if self.temp_dir.strip():
+            return Path(self.temp_dir.strip())
         return self.data_dir / "tmp_audio"
 
     @property

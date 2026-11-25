@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import soundfile as sf
@@ -20,10 +21,14 @@ SAMPLE_RATE = 16000
 MIN_CHUNK_SECONDS = 0.5
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024  # 1 MB
 
-_VAD_LOCK = threading.Lock()
-_VAD_MODEL: Any = None
+_VAD_INIT_LOCK = threading.Lock()
+_VAD_TLS = threading.local()
 _VAD_INIT_FAILED = False
 _VAD_WARNED = False
+_VAD_LOGGED_BACKEND = False
+_VAD_EXECUTOR_LOCK = threading.Lock()
+_VAD_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_VAD_EXECUTOR_WORKERS = 0
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,8 @@ async def decode_to_wav_16k(src_path: Path, dst_wav_path: Path) -> float:
             "-y",
             "-v",
             "error",
+            "-threads",
+            "2",
             "-i",
             str(src_path),
             "-vn",
@@ -160,28 +167,33 @@ def normalize_for_vad(
 
 
 def _get_silero_vad_model() -> Any:
-    """Lazily load CPU ONNX Silero VAD model once (zero GPU VRAM)."""
-    global _VAD_MODEL, _VAD_INIT_FAILED, _VAD_WARNED
-    if _VAD_MODEL is not None:
-        return _VAD_MODEL
+    """Lazily load a thread-local CPU ONNX Silero VAD session (zero GPU VRAM, lock-free concurrency)."""
+    global _VAD_INIT_FAILED, _VAD_WARNED, _VAD_LOGGED_BACKEND
+    cached = getattr(_VAD_TLS, "model", None)
+    if cached is not None:
+        return cached
     if _VAD_INIT_FAILED:
         return None
-    with _VAD_LOCK:
-        if _VAD_MODEL is not None:
-            return _VAD_MODEL
-        if _VAD_INIT_FAILED:
-            return None
-        try:
-            from silero_vad import load_silero_vad
+    try:
+        from silero_vad import load_silero_vad
 
-            try:
-                _VAD_MODEL = load_silero_vad(onnx=True)
-                logger.info("Loaded Silero VAD (ONNX CPU) for lossless boundary chunking.")
-            except Exception:
-                _VAD_MODEL = load_silero_vad(onnx=False)
-                logger.info("Loaded Silero VAD (PyTorch CPU) for lossless boundary chunking.")
-            return _VAD_MODEL
-        except Exception as exc:
+        try:
+            model = load_silero_vad(onnx=True)
+            backend_desc = "ONNX CPU"
+        except Exception:
+            model = load_silero_vad(onnx=False)
+            backend_desc = "PyTorch CPU"
+        _VAD_TLS.model = model
+        with _VAD_INIT_LOCK:
+            if not _VAD_LOGGED_BACKEND:
+                _VAD_LOGGED_BACKEND = True
+                logger.info(
+                    "Loaded Silero VAD (%s, thread-local) for lossless boundary chunking.",
+                    backend_desc,
+                )
+        return model
+    except Exception as exc:
+        with _VAD_INIT_LOCK:
             _VAD_INIT_FAILED = True
             if not _VAD_WARNED:
                 _VAD_WARNED = True
@@ -189,7 +201,21 @@ def _get_silero_vad_model() -> Any:
                     "Silero VAD unavailable (%s); falling back to low-energy boundary chunking.",
                     exc,
                 )
-            return None
+        return None
+
+
+def _get_vad_executor(max_workers: int) -> ThreadPoolExecutor:
+    """Return a shared bounded ThreadPoolExecutor for parallel Silero VAD window evaluation."""
+    global _VAD_EXECUTOR, _VAD_EXECUTOR_WORKERS
+    workers = max(1, int(max_workers))
+    with _VAD_EXECUTOR_LOCK:
+        if _VAD_EXECUTOR is None or _VAD_EXECUTOR_WORKERS != workers:
+            _VAD_EXECUTOR = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="silero-vad",
+            )
+            _VAD_EXECUTOR_WORKERS = workers
+        return _VAD_EXECUTOR
 
 
 def _detect_speech_with_silero(
@@ -198,7 +224,7 @@ def _detect_speech_with_silero(
     threshold: float = 0.5,
     min_silence_ms: int = 150,
 ) -> Optional[List[Dict[str, int]]]:
-    """Run Silero VAD on a normalized 16kHz window under a lock (stateful model)."""
+    """Run Silero VAD on a normalized 16kHz window using the calling thread's dedicated session."""
     model = _get_silero_vad_model()
     if model is None:
         return None
@@ -206,18 +232,17 @@ def _detect_speech_with_silero(
     from silero_vad import get_speech_timestamps
 
     tensor = torch.from_numpy(np.ascontiguousarray(seg_vad, dtype=np.float32))
-    with _VAD_LOCK:
-        if hasattr(model, "reset_states"):
-            model.reset_states()
-        return get_speech_timestamps(
-            tensor,
-            model,
-            sampling_rate=sr,
-            threshold=threshold,
-            min_silence_duration_ms=min_silence_ms,
-            speech_pad_ms=60,
-            return_seconds=False,
-        )
+    if hasattr(model, "reset_states"):
+        model.reset_states()
+    return get_speech_timestamps(
+        tensor,
+        model,
+        sampling_rate=sr,
+        threshold=threshold,
+        min_silence_duration_ms=min_silence_ms,
+        speech_pad_ms=60,
+        return_seconds=False,
+    )
 
 
 def _find_low_energy_offset(seg: np.ndarray, win: int) -> int:
@@ -297,6 +322,52 @@ def _pick_vad_boundary_offset(
     return inner_start + _find_low_energy_offset(seg[inner_start:inner_end], sub_win)
 
 
+def _resolve_window_boundary(
+    seg: np.ndarray,
+    sr: int,
+    left: int,
+    cut: int,
+    win: int,
+    use_vad: bool,
+    vad_threshold: float,
+    vad_min_silence_ms: int,
+    speech_timestamps_fn: Optional[Callable[[np.ndarray, int], Optional[List[Dict[str, int]]]]],
+) -> int:
+    """Resolve optimal cut frame inside [left, left + len(seg)] via Silero VAD or energy fallback."""
+    if len(seg) <= win:
+        return cut
+
+    chosen_rel: Optional[int] = None
+    if use_vad:
+        try:
+            seg_vad = normalize_for_vad(seg)
+            if speech_timestamps_fn is not None:
+                ts = speech_timestamps_fn(seg_vad, sr)
+            else:
+                ts = _detect_speech_with_silero(
+                    seg_vad,
+                    sr,
+                    threshold=vad_threshold,
+                    min_silence_ms=vad_min_silence_ms,
+                )
+            if ts is not None:
+                chosen_rel = _pick_vad_boundary_offset(
+                    seg=seg,
+                    sr=sr,
+                    target_rel=cut - left,
+                    win=win,
+                    speech_timestamps=ts,
+                    min_gap_ms=min(120, vad_min_silence_ms),
+                )
+        except Exception as exc:
+            logger.warning("Silero VAD boundary search failed (%s); using energy fallback.", exc)
+
+    if chosen_rel is None:
+        chosen_rel = _find_low_energy_offset(seg, win)
+
+    return left + int(chosen_rel)
+
+
 def compute_chunks(
     wav_path: Path,
     target_sec: float = 120.0,
@@ -306,6 +377,7 @@ def compute_chunks(
     vad_threshold: float = 0.5,
     vad_min_silence_ms: int = 150,
     speech_timestamps_fn: Optional[Callable[[np.ndarray, int], Optional[List[Dict[str, int]]]]] = None,
+    max_workers: int = 1,
 ) -> List[ChunkSpec]:
     """
     Compute non-overlapping, gap-free (lossless) chunk boundaries for a 16kHz mono WAV.
@@ -313,7 +385,8 @@ def compute_chunks(
     - `strategy="vad"`: runs loudness-normalized Silero VAD only on small ±search_expand_sec
       windows around candidate split points, snapping cuts to the middle of real non-speech
       pauses while preserving 100% of audio frames (zero dropped speech/silence).
-      Falls back cleanly to low-energy minimum if Silero VAD is unavailable or no pause exists.
+      When candidate windows are disjoint and `target_sec + 2*search_expand_sec <= 170s`,
+      evaluates all windows in parallel across thread-local ONNX sessions for multi-hour speed.
     - `strategy="energy"`: uses sliding-window minimum amplitude around candidate split points.
     """
     with sf.SoundFile(str(wav_path), mode="r") as f:
@@ -338,7 +411,92 @@ def compute_chunks(
         win = max(4, int(round((min_window_ms / 1000.0) * sr)))
         use_vad = strategy == "vad"
 
-        chunks: List[ChunkSpec] = []
+        # Fast parallel disjoint-window mode for multi-chunk recordings:
+        # Nominal cut centers at k*max_len (k=1,2,...) have disjoint ±expand windows when
+        # max_len > 2*expand + win, guaranteeing worst-case chunk <= target_sec + 2*expand <= 170s.
+        can_parallel = (
+            max_len > (2 * expand + win)
+            and (target_sec + 2.0 * search_expand_sec) <= 170.0
+        )
+        if can_parallel:
+            window_jobs: List[tuple[int, int, np.ndarray]] = []
+            k = 1
+            while (k * max_len + expand) < total_frames:
+                cut = k * max_len
+                left = max(0, cut - expand)
+                right = min(total_frames, cut + expand)
+                f.seek(left)
+                seg = f.read(frames=right - left, dtype="float32", always_2d=False)
+                if seg.ndim == 2:
+                    seg = np.mean(seg, axis=-1).astype(np.float32)
+                window_jobs.append((left, cut, seg))
+                k += 1
+
+            if window_jobs:
+                def _eval_one(job: tuple[int, int, np.ndarray]) -> int:
+                    w_left, w_cut, w_seg = job
+                    return _resolve_window_boundary(
+                        seg=w_seg,
+                        sr=sr,
+                        left=w_left,
+                        cut=w_cut,
+                        win=win,
+                        use_vad=use_vad,
+                        vad_threshold=vad_threshold,
+                        vad_min_silence_ms=vad_min_silence_ms,
+                        speech_timestamps_fn=speech_timestamps_fn,
+                    )
+
+                if use_vad and speech_timestamps_fn is None and max_workers > 1 and len(window_jobs) > 1:
+                    executor = _get_vad_executor(max_workers)
+                    boundaries = list(executor.map(_eval_one, window_jobs))
+                else:
+                    boundaries = [_eval_one(j) for j in window_jobs]
+
+                chunks: List[ChunkSpec] = []
+                start = 0
+                chunk_idx = 0
+                for b in boundaries:
+                    boundary = max(start + 1, min(int(b), total_frames - 1))
+                    if boundary <= start:
+                        continue
+                    chunks.append(
+                        ChunkSpec(
+                            chunk_index=chunk_idx,
+                            start_frame=start,
+                            end_frame=boundary,
+                            start_sec=round(start / float(sr), 3),
+                            end_sec=round(boundary / float(sr), 3),
+                        )
+                    )
+                    chunk_idx += 1
+                    start = boundary
+
+                if start < total_frames:
+                    chunks.append(
+                        ChunkSpec(
+                            chunk_index=chunk_idx,
+                            start_frame=start,
+                            end_frame=total_frames,
+                            start_sec=round(start / float(sr), 3),
+                            end_sec=round(total_frames / float(sr), 3),
+                        )
+                    )
+                return chunks
+
+            # Audio is between max_len and max_len + expand (<= 135s <= 170s): keep single chunk
+            return [
+                ChunkSpec(
+                    chunk_index=0,
+                    start_frame=0,
+                    end_frame=total_frames,
+                    start_sec=0.0,
+                    end_sec=round(total_frames / float(sr), 3),
+                )
+            ]
+
+        # Fallback sequential mode (when expand is large relative to target_sec)
+        chunks = []
         start = 0
         chunk_idx = 0
 
@@ -354,36 +512,17 @@ def compute_chunks(
                 seg = f.read(frames=right - left, dtype="float32", always_2d=False)
                 if seg.ndim == 2:
                     seg = np.mean(seg, axis=-1).astype(np.float32)
-
-                chosen_rel: Optional[int] = None
-                if use_vad:
-                    try:
-                        seg_vad = normalize_for_vad(seg)
-                        if speech_timestamps_fn is not None:
-                            ts = speech_timestamps_fn(seg_vad, sr)
-                        else:
-                            ts = _detect_speech_with_silero(
-                                seg_vad,
-                                sr,
-                                threshold=vad_threshold,
-                                min_silence_ms=vad_min_silence_ms,
-                            )
-                        if ts is not None:
-                            chosen_rel = _pick_vad_boundary_offset(
-                                seg=seg,
-                                sr=sr,
-                                target_rel=cut - left,
-                                win=win,
-                                speech_timestamps=ts,
-                                min_gap_ms=min(120, vad_min_silence_ms),
-                            )
-                    except Exception as exc:
-                        logger.warning("Silero VAD boundary search failed (%s); using energy fallback.", exc)
-
-                if chosen_rel is None:
-                    chosen_rel = _find_low_energy_offset(seg, win)
-
-                boundary = left + chosen_rel
+                boundary = _resolve_window_boundary(
+                    seg=seg,
+                    sr=sr,
+                    left=left,
+                    cut=cut,
+                    win=win,
+                    use_vad=use_vad,
+                    vad_threshold=vad_threshold,
+                    vad_min_silence_ms=vad_min_silence_ms,
+                    speech_timestamps_fn=speech_timestamps_fn,
+                )
 
             boundary = max(start + 1, min(int(boundary), total_frames))
             chunks.append(
@@ -428,18 +567,7 @@ def compute_low_energy_chunks(
     )
 
 
-def read_chunk_waveform(
-    wav_path: Path,
-    start_frame: int,
-    end_frame: int,
-    min_sec: float = MIN_CHUNK_SECONDS,
-) -> tuple[np.ndarray, int]:
-    """Seek-read a specific frame range as mono float32 waveform in [-1, 1]."""
-    with sf.SoundFile(str(wav_path), mode="r") as f:
-        sr = int(f.samplerate)
-        f.seek(start_frame)
-        wav = f.read(frames=max(0, end_frame - start_frame), dtype="float32", always_2d=False)
-
+def _normalize_chunk_array(wav: np.ndarray, sr: int, min_sec: float) -> tuple[np.ndarray, int]:
     wav = np.asarray(wav, dtype=np.float32)
     if wav.ndim == 2:
         wav = np.mean(wav, axis=-1).astype(np.float32)
@@ -452,3 +580,35 @@ def read_chunk_waveform(
     if peak > 1.0:
         wav = wav / peak
     return np.clip(wav, -1.0, 1.0), sr
+
+
+def read_chunk_waveform(
+    wav_path: Path,
+    start_frame: int,
+    end_frame: int,
+    min_sec: float = MIN_CHUNK_SECONDS,
+) -> tuple[np.ndarray, int]:
+    """Seek-read a specific frame range as mono float32 waveform in [-1, 1]."""
+    with sf.SoundFile(str(wav_path), mode="r") as f:
+        sr = int(f.samplerate)
+        f.seek(start_frame)
+        wav = f.read(frames=max(0, end_frame - start_frame), dtype="float32", always_2d=False)
+    return _normalize_chunk_array(wav, sr, min_sec)
+
+
+def read_chunks_from_wav(
+    wav_path: Path,
+    chunks: Sequence[Dict[str, Any]],
+    min_sec: float = MIN_CHUNK_SECONDS,
+) -> List[tuple[np.ndarray, int]]:
+    """Open a WAV file once and seek-read multiple chunk frame ranges."""
+    results: List[tuple[np.ndarray, int]] = []
+    with sf.SoundFile(str(wav_path), mode="r") as f:
+        sr = int(f.samplerate)
+        for ch in chunks:
+            start_frame = int(ch["start_frame"])
+            end_frame = int(ch["end_frame"])
+            f.seek(start_frame)
+            wav = f.read(frames=max(0, end_frame - start_frame), dtype="float32", always_2d=False)
+            results.append(_normalize_chunk_array(wav, sr, min_sec))
+    return results
