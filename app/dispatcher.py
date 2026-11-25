@@ -20,7 +20,7 @@ from app.alignment import (
     build_segments_from_chunk,
     merge_languages,
 )
-from app.audio import ChunkSpec, compute_low_energy_chunks, decode_to_wav_16k
+from app.audio import ChunkSpec, compute_chunks, decode_to_wav_16k
 from app.config import Settings
 from app.store import TaskStore
 from app.worker import gpu_worker_main
@@ -265,10 +265,14 @@ class DualGPUDispatcher:
         """Split a 16kHz WAV into low-energy chunks, dispatch across GPUs, and assemble results."""
         t0 = time.perf_counter()
         chunks = await asyncio.to_thread(
-            compute_low_energy_chunks,
+            compute_chunks,
             wav_path,
             self.settings.chunk_target_sec,
             self.settings.chunk_search_expand_sec,
+            100.0,
+            self.settings.chunk_strategy,
+            self.settings.vad_threshold,
+            self.settings.vad_min_silence_ms,
         )
         total_chunks = len(chunks)
         if total_chunks == 0:

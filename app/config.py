@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     )
 
     # Long audio chunking & upload limits
+    chunk_strategy: Literal["vad", "energy"] = Field(
+        default="vad",
+        description="Boundary selection strategy for long audio: 'vad' (Silero VAD guided, lossless) or 'energy'",
+    )
     chunk_target_sec: float = Field(
         default=120.0,
         ge=10.0,
@@ -95,10 +99,22 @@ class Settings(BaseSettings):
         description="Target chunk length in seconds (must stay below ForcedAligner 180s limit)",
     )
     chunk_search_expand_sec: float = Field(
-        default=5.0,
+        default=15.0,
         ge=0.5,
-        le=15.0,
-        description="Half-window in seconds to search for low-energy split boundary",
+        le=25.0,
+        description="Half-window in seconds around target cut point to search for pause/silence boundary",
+    )
+    vad_threshold: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=0.9,
+        description="Silero VAD speech probability threshold",
+    )
+    vad_min_silence_ms: int = Field(
+        default=150,
+        ge=50,
+        le=2000,
+        description="Minimum non-speech pause duration (ms) preferred for Silero VAD boundary snapping",
     )
     max_upload_size_mb: int = Field(
         default=500,

@@ -15,7 +15,13 @@ from app.alignment import (
     has_alignable_text,
     merge_languages,
 )
-from app.audio import SAMPLE_RATE, compute_low_energy_chunks, read_chunk_waveform
+from app.audio import (
+    SAMPLE_RATE,
+    compute_chunks,
+    compute_low_energy_chunks,
+    normalize_for_vad,
+    read_chunk_waveform,
+)
 from app.worker import normalize_requested_language
 
 
@@ -44,6 +50,64 @@ def test_low_energy_chunking_snaps_to_silence_and_preserves_all_frames(tmp_path:
 
     # First boundary should snap inside the silent valley [10.6, 11.2]
     assert 10.55 <= chunks[0].end_sec <= 11.25
+
+
+def test_normalize_for_vad_handles_very_quiet_loud_and_silence() -> None:
+    t = np.arange(SAMPLE_RATE * 2, dtype=np.float32) / SAMPLE_RATE
+    base = np.sin(2 * np.pi * 300.0 * t).astype(np.float32)
+
+    # Very quiet speech (~ -45 dBFS) should be boosted near target_rms (0.08)
+    quiet = base * 0.005
+    quiet_norm = normalize_for_vad(quiet)
+    quiet_rms = float(np.sqrt(np.mean(quiet_norm * quiet_norm)))
+    assert 0.06 <= quiet_rms <= 0.10
+
+    # Very loud speech (peak ~0.98) should be attenuated near target_rms without clipping
+    loud = base * 0.98
+    loud_norm = normalize_for_vad(loud)
+    loud_rms = float(np.sqrt(np.mean(loud_norm * loud_norm)))
+    assert 0.06 <= loud_rms <= 0.10
+    assert float(np.max(np.abs(loud_norm))) <= 0.99
+
+    # Pure near-zero silence must NOT be amplified into false speech
+    silence = np.full(SAMPLE_RATE, 1e-6, dtype=np.float32)
+    sil_norm = normalize_for_vad(silence)
+    assert float(np.max(np.abs(sil_norm))) < 1e-4
+
+
+def test_vad_guided_chunking_snaps_to_longest_pause_under_bgm_and_stays_lossless(tmp_path: Path) -> None:
+    # 30s audio with constant loud BGM so energy alone cannot distinguish speech vs pause
+    duration_sec = 30
+    total_frames = duration_sec * SAMPLE_RATE
+    t = np.arange(total_frames, dtype=np.float32) / SAMPLE_RATE
+    wav = (0.3 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+
+    wav_path = tmp_path / "bgm_test.wav"
+    sf.write(str(wav_path), wav, SAMPLE_RATE, subtype="PCM_16")
+
+    # Mock VAD detector: speech across window except a clear 1.0s non-speech pause at [2.5s, 3.5s]
+    # relative to each 4s window (cut=10s, expand=2s -> window [8s, 12s] -> pause at [10.5s, 11.5s])
+    def fake_vad(seg_vad: np.ndarray, sr: int):
+        assert 0.05 <= float(np.sqrt(np.mean(seg_vad * seg_vad))) <= 0.12
+        return [
+            {"start": 0, "end": int(2.5 * sr)},
+            {"start": int(3.5 * sr), "end": len(seg_vad)},
+        ]
+
+    chunks = compute_chunks(
+        wav_path,
+        target_sec=10.0,
+        search_expand_sec=2.0,
+        strategy="vad",
+        speech_timestamps_fn=fake_vad,
+    )
+    assert len(chunks) == 3
+    assert chunks[0].start_frame == 0
+    for prev, cur in zip(chunks, chunks[1:]):
+        assert prev.end_frame == cur.start_frame
+    assert chunks[-1].end_frame == total_frames
+    # Should land inside the central 60% of the [10.5s, 11.5s] non-speech gap -> [10.7s, 11.3s]
+    assert 10.65 <= chunks[0].end_sec <= 11.35
 
 
 def test_read_chunk_waveform_pads_short_tail(tmp_path: Path) -> None:
