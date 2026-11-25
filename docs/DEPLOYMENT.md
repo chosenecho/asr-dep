@@ -225,7 +225,7 @@ ssh -N -L 127.0.0.1:6006:127.0.0.1:6006 -o ExitOnForwardFailure=yes -o ServerAli
 
 | 硬件与业务场景 | 推荐参数组合 | 预期表现 |
 | :--- | :--- | :--- |
-| **单卡 32GB（RTX 4080 SUPER / 5090）** 长录音高并发（带词级对齐） | `GPU_IDS=0`<br>`GPU_MEMORY_UTILIZATION=0.58`<br>`MAX_INFERENCE_BATCH_SIZE=24`<br>`ALIGNER_BATCH_SIZE=6`<br>`CHUNKS_PER_DISPATCH=6`<br>`BATCH_COALESCE_WAIT_MS=40`<br>`TEMP_DIR=/dev/shm/qwen3_asr_tmp` | 8 并发 × 20m 实测 **`285.3×` 聚合 / `~319×` 稳态**，显存峰值稳定 `~30.2 GB / 32.8 GB` |
+| **单卡 32GB（RTX 4080 SUPER / 5090）** 长录音高并发（带词级对齐） | `GPU_IDS=0`<br>`GPU_MEMORY_UTILIZATION=0.58`<br>`MAX_INFERENCE_BATCH_SIZE=24`<br>`ALIGNER_BATCH_SIZE=6`<br>`CHUNKS_PER_DISPATCH=6`<br>`BATCH_COALESCE_WAIT_MS=40`<br>`TEMP_DIR=/dev/shm/qwen3_asr_tmp` | 真实高密度长录音多并发约 **`120×–160×` 实时**，GPU 算力/带宽可跑满，显存峰值稳定 `~29.5–30.2 GB / 32.8 GB` |
 | **双卡 24GB（2 × RTX 4090）** 长录音高并发（带词级对齐） | `GPU_IDS=0,1`<br>`GPU_MEMORY_UTILIZATION=0.62`<br>`MAX_INFERENCE_BATCH_SIZE=16`<br>`ALIGNER_BATCH_SIZE=6`<br>`CHUNKS_PER_DISPATCH=4`<br>`BATCH_COALESCE_WAIT_MS=15` | 每张 4090 为 vLLM 留 ~14.9 GB、ForcedAligner 留 ~9.1 GB，双卡线性扩展 |
 | **纯文本极速转写（不需要时间戳）** | 置空 `ALIGNER_MODEL_PATH=`<br>`GPU_MEMORY_UTILIZATION=0.88`<br>`MAX_INFERENCE_BATCH_SIZE=32` | 省去 ForcedAligner 显存与计算，吞吐再提升 ~20% |
 

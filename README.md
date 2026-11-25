@@ -2,7 +2,7 @@
 
 基于 **FastAPI + `qwen-asr[vllm]` + `Qwen3-ForcedAligner-0.6B` + Silero VAD (ONNX)** 的高并发长录音生产级语音识别 API 服务。
 
-面向 **单卡 / 多卡 GPU（RTX 4080 SUPER 32GB / 双路 RTX 4090 24GB 等）**、**多并发小时级长录音离线转写** 与 **字词级/句级时间戳及 SRT/VTT 字幕直出** 深度优化；在单张 RTX 4080 SUPER 32GB 上实测 **8 并发 × 20 分钟（共 160 分钟，全量 ForcedAligner 词级对齐）聚合吞吐达 `285.3×` 实时（稳态 `~319×` 实时，1 小时录音 ≈ 12 秒）**。
+面向 **单卡 / 多卡 GPU（RTX 4080 SUPER 32GB / 双路 RTX 4090 24GB 等）**、**多并发小时级长录音离线转写** 与 **字词级/句级时间戳及 SRT/VTT 字幕直出** 深度优化；在单张 RTX 4080 SUPER 32GB 上处理高密度真实中文/英文多并发长录音（开启全量 ForcedAligner 词级对齐）实测稳态聚合吞吐约 **`120×–160×` 实时**（视语速密度、语种及是否开启对齐而定，1 小时真实录音约需 22–30 秒）。
 
 ## 文档导航
 
@@ -31,15 +31,16 @@
   - OpenAI Whisper 兼容接口（`POST /v1/audio/transcriptions`，支持 `verbose_json` / `srt` / `vtt`）；
   - API Key 鉴权（`Authorization: Bearer` 或 `X-API-Key`）、Webhook SSRF 防护、Nginx 大文件反向代理配置。
 
-## 实测性能（单卡 RTX 4080 SUPER 32GB，全量 ForcedAligner 词/句对齐）
+## 实际性能参考（单卡 RTX 4080 SUPER 32GB，全量 ForcedAligner 词/句对齐）
 
-测试配置：`GPU_MEMORY_UTILIZATION=0.58`、`MAX_INFERENCE_BATCH_SIZE=24`、`ALIGNER_BATCH_SIZE=6`、`CHUNKS_PER_DISPATCH=6`、`CHUNK_STRATEGY=vad`、`TEMP_DIR=/dev/shm/qwen3_asr_tmp`
+参考配置：`GPU_MEMORY_UTILIZATION=0.58`、`MAX_INFERENCE_BATCH_SIZE=24`、`ALIGNER_BATCH_SIZE=6`、`CHUNKS_PER_DISPATCH=6`、`CHUNK_STRATEGY=vad`、`TEMP_DIR=/dev/shm/qwen3_asr_tmp`
 
-| 压测场景 | 总音频时长 | 端到端总耗时 | 聚合吞吐 | 显存峰值 |
-| :--- | :---: | :---: | :---: | :---: |
-| 4 并发 × 20 分钟（优化前基线） | 80 分钟 | `46.05s` | `104.2×` 实时 | `31,481 MiB` (96.1%) |
-| 4 并发 × 20 分钟（优化后） | 80 分钟 | `27.60s` | `173.9×` 实时 | `30,015 MiB` (91.6%) |
-| **8 并发 × 20 分钟（优化后高压）** | **160 分钟（2.67h）** | **`33.65s`** | **`285.3×` 实时**（稳态 `~319×`） | **`30,205 MiB`** (92.2%) |
+| 场景说明 | 典型聚合吞吐（带全量对齐） | GPU 负载与显存 |
+| :--- | :---: | :--- |
+| **真实高密度中文/多语种多并发长录音**（如 ~300 字/分钟播客/视频/会议，4–8 并发） | **约 `120×–160×` 实时**（1 小时 ≈ 22–30s） | 算力/显存带宽可达 `100%`，显存峰值 `~29.5–30.2 GB / 32.8 GB` |
+| **稀疏/低语速音频或关闭时间戳（`return_timestamps=false`）** | 可进一步提升至 **`180×–250×+` 实时** | 随输出 Token 密度下降线性加快 |
+
+> **说明**：自回归 ASR 解码耗时与单位时间输出 Token 数强相关，因此高语速中文内容（~300 字/分）的实际倍速会明显低于低语速或静音占比高的音频；多并发下通过跨任务动态合批与后台预取可稳定打满 GPU 算力。
 
 ## 显存规划建议
 
