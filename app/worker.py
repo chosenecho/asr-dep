@@ -113,6 +113,7 @@ def _load_real_model(worker_cfg: Dict[str, Any], logger: logging.Logger) -> Any:
             gpu_memory_utilization=float(worker_cfg["gpu_memory_utilization"]),
             max_inference_batch_size=int(worker_cfg["max_inference_batch_size"]),
             max_new_tokens=int(worker_cfg["max_new_tokens"]),
+            enable_mm_embeds=True,
             forced_aligner=aligner_path,
             forced_aligner_kwargs=aligner_kwargs,
         )
