@@ -1,39 +1,52 @@
-# Qwen3-ASR-1.7B 双路 RTX 4090 长录音转写 API 服务
+# qwen3-asr-server
 
-基于 **FastAPI + `qwen-asr[vllm]` + `Qwen3-ForcedAligner-0.6B`** 的生产级语音识别服务，专为 **双路 RTX 4090 (2 × 24GB)**、**长录音离线转写** 与 **句级/字词级时间戳输出** 优化。
+基于 **FastAPI + `qwen-asr[vllm]` + `Qwen3-ForcedAligner-0.6B` + Silero VAD (ONNX)** 的高并发长录音生产级语音识别 API 服务。
+
+面向 **单卡 / 多卡 GPU（RTX 4080 SUPER 32GB / 双路 RTX 4090 24GB 等）**、**多并发小时级长录音离线转写** 与 **字词级/句级时间戳及 SRT/VTT 字幕直出** 深度优化；在单张 RTX 4080 SUPER 32GB 上实测 **8 并发 × 20 分钟（共 160 分钟，全量 ForcedAligner 词级对齐）聚合吞吐达 `285.3×` 实时（稳态 `~319×` 实时，1 小时录音 ≈ 12 秒）**。
 
 ## 文档导航
 
 - [API 参考文档](docs/API.md)：全部接口说明、请求/响应示例、OpenAI 兼容层、Webhook 回调与错误码
 - [部署与运维指南](docs/DEPLOYMENT.md)：软硬件依赖、完整环境变量表、Docker/Nginx/HTTPS、systemd 裸机部署、显存调优与排障
-- [系统架构设计](docs/ARCHITECTURE.md)：双卡数据并行原理、长录音零 OOM 流式链路、时间戳对齐机制与项目目录结构
+- [系统架构设计](docs/ARCHITECTURE.md)：多卡数据并行原理、长录音零 OOM 流式链路、时间戳对齐机制与项目目录结构
 
 ## 核心架构特性
 
-- **双卡 4090 真并行（数据并行，非 TP）**：每张 4090 启动 1 个独立 `spawn` 进程（`CUDA_VISIBLE_DEVICES=0` 与 `CUDA_VISIBLE_DEVICES=1`），各自常驻 `Qwen3-ASR-1.7B`（vLLM）+ `Qwen3-ForcedAligner-0.6B`。
-  - **单个超长录音**自动按低能量静音边界切分为 ≤125s 片段（满足 ForcedAligner 180s 上限），拆成小批次**同时派发给两张 4090 并行处理**，实现单任务近 2× 加速；
-  - **多路并发请求**在双卡间自动负载均衡，避免短音频被长任务阻塞。
-- **长录音全链路防 OOM**：流式落盘上传 → `ffmpeg` 统一转码 16kHz 单声道（支持 mp3/m4a/mp4/wav/flac/ogg/amr/webm 等）→ 磁盘 Seek 检索低能量切分点 → 按片读取推理 → 自动清理临时文件。
+- **多卡真并行（每卡独立 Worker 数据并行）**：每张 GPU 启动 1 个独立 `spawn` 进程（支持单卡 `GPU_IDS=0` 或多卡 `GPU_IDS=0,1`），各自常驻 `Qwen3-ASR-1.7B`（vLLM）+ `Qwen3-ForcedAligner-0.6B`。
+- **响度自适应 + 无 GIL 批量 ONNX Silero VAD 无损切分**：
+  - 仅对候选切分点（默认 120s ±15s）做临时响度归一化（自适应极小声/极大声录音，不改动原始送入 ASR 的波形）并用纯 NumPy 批量 ONNX Runtime C++ 推理定位真实停顿中点；
+  - 100% 保留原始音频帧（零丢字、零重叠、满足 ForcedAligner 180s 上限），多并发零 Python GIL 争抢。
+- **高并发长录音深度压榨（公平轮转 + 跨任务合批 + 后台预取）**：
+  - **公平轮转调度器**：多条长录音按小切片粒度（`CHUNKS_PER_DISPATCH`）交错派发，消除队头阻塞，并限制并发 `ffmpeg` 转码数（`MAX_CONCURRENT_DECODES`）；
+  - **Worker 跨任务动态合批**：后台预取线程自动将多个并发任务的切片与零散尾批合并为最高 `MAX_INFERENCE_BATCH_SIZE`（如 `24`）的大 Batch 一次送入 vLLM（原生保留各自 `language` 与 `context`）；
+  - **ForcedAligner 显存解耦 + 预取梅尔频谱**：对齐子批大小（`ALIGNER_BATCH_SIZE`）与 vLLM 批大小解耦防止长音频峰值 OOM；预取线程在 GPU 推理上一批时并行提前计算 Whisper 128 维梅尔特征，对齐阶段零等待复用；
+  - **内存盘临时音频区**：支持 `TEMP_DIR=/dev/shm/qwen3_asr_tmp` 消除临时 WAV 磁盘 I/O 延迟，任务完成后自动清理。
 - **双粒度时间戳 + 字幕直出**：
   - `words`：来自 `Qwen3-ForcedAligner-0.6B` 的字/词级时间戳；
   - `segments`：自动将带标点的 ASR 文本与词级时间戳对齐，重建可读的句/子句级时间戳；
-  - 内置 **SRT / WebVTT** 字幕导出接口；
-  - 单片静音或遇到 ForcedAligner 不支持的语种时**自动降级为切片级时间戳**，绝不拖垮整段长录音任务。
+  - 内置 **SRT / WebVTT** 字幕导出接口；单片静音或不支持语种时自动降级，绝不拖垮整段长录音任务。
 - **对外 API 完备**：
-  - 长录音异步任务 API（`POST /v1/asr/tasks` + 进度轮询 + Webhook 回调 + SQLite 持久化）；
-  - 短/中音频同步 API（`POST /v1/asr/transcribe`）；
+  - 长录音异步任务 API（`POST /v1/asr/tasks` + 进度轮询 + Webhook 回调 + SQLite WAL 持久化）；
+  - 短/中音频同步 API（`POST /v1/asr/transcribe`，支持直接返回 `json` / `text` / `srt` / `vtt`）；
   - OpenAI Whisper 兼容接口（`POST /v1/audio/transcriptions`，支持 `verbose_json` / `srt` / `vtt`）；
   - API Key 鉴权（`Authorization: Bearer` 或 `X-API-Key`）、Webhook SSRF 防护、Nginx 大文件反向代理配置。
 
-## 显存规划（单张 RTX 4090 24GB）
+## 实测性能（单卡 RTX 4080 SUPER 32GB，全量 ForcedAligner 词/句对齐）
 
-| 组件 | 预计显存 | 说明 |
+测试配置：`GPU_MEMORY_UTILIZATION=0.58`、`MAX_INFERENCE_BATCH_SIZE=24`、`ALIGNER_BATCH_SIZE=6`、`CHUNKS_PER_DISPATCH=6`、`CHUNK_STRATEGY=vad`、`TEMP_DIR=/dev/shm/qwen3_asr_tmp`
+
+| 压测场景 | 总音频时长 | 端到端总耗时 | 聚合吞吐 | 显存峰值 |
+| :--- | :---: | :---: | :---: | :---: |
+| 4 并发 × 20 分钟（优化前基线） | 80 分钟 | `46.05s` | `104.2×` 实时 | `31,481 MiB` (96.1%) |
+| 4 并发 × 20 分钟（优化后） | 80 分钟 | `27.60s` | `173.9×` 实时 | `30,015 MiB` (91.6%) |
+| **8 并发 × 20 分钟（优化后高压）** | **160 分钟（2.67h）** | **`33.65s`** | **`285.3×` 实时**（稳态 `~319×`） | **`30,205 MiB`** (92.2%) |
+
+## 显存规划建议
+
+| 显卡规格 | 推荐 `.env` 关键参数 | 说明 |
 | :--- | :--- | :--- |
-| `Qwen3-ASR-1.7B` (vLLM BF16 + KV Cache) | ~17.3 GB | 默认 `GPU_MEMORY_UTILIZATION=0.72` |
-| `Qwen3-ForcedAligner-0.6B` (BF16 + 推理激活) | ~2.5–3.5 GB | 与 ASR 同卡，支持批对齐 |
-| 系统与安全余量 | ~3.2–4.2 GB | 防止长音频批次峰值 OOM |
-
-> 若希望进一步提速，可在开启 `USE_FLASH_ATTENTION=true`（官方镜像 `qwenllm/qwen3-asr:latest` 已内置 FlashAttention 2）的前提下微调 `MAX_INFERENCE_BATCH_SIZE=12~16`。
+| **RTX 4080 SUPER / 32GB** | `GPU_MEMORY_UTILIZATION=0.58`<br>`MAX_INFERENCE_BATCH_SIZE=24`<br>`ALIGNER_BATCH_SIZE=6` | vLLM 预留 ~19GB，余量给 ForcedAligner 与激活峰值，8 并发稳定无 OOM |
+| **RTX 4090 / 24GB（单卡或双卡）** | `GPU_MEMORY_UTILIZATION=0.62`<br>`MAX_INFERENCE_BATCH_SIZE=16`<br>`ALIGNER_BATCH_SIZE=6` | 双卡设 `GPU_IDS=0,1` 即可线性翻倍吞吐 |
 
 ---
 
