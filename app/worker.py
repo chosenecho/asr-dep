@@ -113,7 +113,6 @@ def _load_real_model(worker_cfg: Dict[str, Any], logger: logging.Logger) -> Any:
             gpu_memory_utilization=float(worker_cfg["gpu_memory_utilization"]),
             max_inference_batch_size=int(worker_cfg["max_inference_batch_size"]),
             max_new_tokens=int(worker_cfg["max_new_tokens"]),
-            enable_mm_embeds=True,
             forced_aligner=aligner_path,
             forced_aligner_kwargs=aligner_kwargs,
         )
@@ -450,92 +449,6 @@ def _process_mock_batch(work_item: Dict[str, Any]) -> List[Dict[str, Any]]:
     return results
 
 
-_VLLM_PRECOMPUTE_DISABLED = False
-
-
-def _infer_asr_vllm_precomputed(
-    model: Any,
-    all_contexts: List[str],
-    all_req_langs: List[Optional[str]],
-    all_mels: List[Optional[Tuple[Any, Any]]],
-    logger: logging.Logger,
-) -> Optional[Tuple[List[str], List[str]]]:
-    """
-    Feed already-precomputed Whisper mel features directly into vLLM via Qwen3ASR's
-    DictEmbeddingItems path, completely eliminating vLLM's synchronous CPU mel extraction gap.
-    Returns (texts, langs) or None if unavailable/failed so caller falls back to model.transcribe().
-    """
-    global _VLLM_PRECOMPUTE_DISABLED
-    if _VLLM_PRECOMPUTE_DISABLED:
-        return None
-    if getattr(model, "backend", None) != "vllm":
-        return None
-    if not all_mels or not all(m is not None for m in all_mels):
-        return None
-    if not hasattr(model, "_build_text_prompt") or not hasattr(model, "sampling_params"):
-        return None
-
-    try:
-        import torch
-        from qwen_asr.inference.utils import (
-            normalize_language_name,
-            parse_asr_output,
-            validate_language,
-        )
-
-        langs_norm: List[Optional[str]] = []
-        for l in all_req_langs:
-            if l is None or str(l).strip() == "":
-                langs_norm.append(None)
-            else:
-                ln = normalize_language_name(str(l))
-                validate_language(ln)
-                langs_norm.append(ln)
-
-        vllm_inputs: List[Dict[str, Any]] = []
-        for ctx, fl, mel in zip(all_contexts, langs_norm, all_mels):
-            assert mel is not None
-            feat, mask = mel
-            prompt = model._build_text_prompt(context=ctx, force_language=fl)
-            input_audio_features = (
-                feat.permute(0, 2, 1)[mask.bool()].permute(1, 0).contiguous()
-            )
-            audio_feature_lengths = mask.sum(-1).to(dtype=torch.long)
-            vllm_inputs.append(
-                {
-                    "prompt": prompt,
-                    "multi_modal_data": {
-                        "audio": {
-                            "input_audio_features": input_audio_features,
-                            "audio_feature_lengths": audio_feature_lengths,
-                        }
-                    },
-                }
-            )
-
-        raw_outputs = model.model.generate(
-            vllm_inputs,
-            sampling_params=model.sampling_params,
-            use_tqdm=False,
-        )
-
-        texts: List[str] = []
-        langs: List[str] = []
-        for out_obj, forced_lang, orig_req in zip(raw_outputs, langs_norm, all_req_langs):
-            raw_txt = out_obj.outputs[0].text
-            pred_lang, pred_txt = parse_asr_output(raw_txt, user_language=forced_lang)
-            texts.append(pred_txt or "")
-            langs.append(pred_lang or (orig_req or ""))
-        return texts, langs
-    except Exception as exc:
-        _VLLM_PRECOMPUTE_DISABLED = True
-        logger.warning(
-            "Precomputed-mel vLLM fast path unavailable (%s); falling back to model.transcribe().",
-            exc,
-        )
-        return None
-
-
 def _process_real_superbatch(
     model: Any,
     loaded_items: List[Tuple[Dict[str, Any], List[tuple], List[Optional[Tuple[Any, Any]]]]],
@@ -544,8 +457,8 @@ def _process_real_superbatch(
     prep_executor: ThreadPoolExecutor,
 ) -> List[Tuple[str, List[Dict[str, Any]]]]:
     """
-    Run ONE coalesced vLLM ASR pass across chunks from multiple concurrent jobs
-    using precomputed shared mel features, followed by zero-mel ForcedAligner,
+    Run ONE coalesced vLLM ASR pass across chunks from multiple concurrent jobs,
+    followed by zero-mel ForcedAligner reusing precomputed Whisper mel features,
     then split results per batch_id.
     """
     all_audios: List[tuple] = []
@@ -574,26 +487,16 @@ def _process_real_superbatch(
     if not all_audios:
         return [(wi["batch_id"], []) for wi, _, _ in slices]
 
-    fast_res = _infer_asr_vllm_precomputed(
-        model=model,
-        all_contexts=all_contexts,
-        all_req_langs=all_req_langs,
-        all_mels=all_mels,
-        logger=logger,
+    asr_outputs = model.transcribe(
+        audio=all_audios,
+        context=all_contexts,
+        language=all_req_langs,
+        return_time_stamps=False,
     )
-    if fast_res is not None:
-        texts, langs = fast_res
-    else:
-        asr_outputs = model.transcribe(
-            audio=all_audios,
-            context=all_contexts,
-            language=all_req_langs,
-            return_time_stamps=False,
-        )
-        texts = [r.text or "" for r in asr_outputs]
-        langs = [
-            (r.language or (req_l or "")) for r, req_l in zip(asr_outputs, all_req_langs)
-        ]
+    texts = [r.text or "" for r in asr_outputs]
+    langs = [
+        (r.language or (req_l or "")) for r, req_l in zip(asr_outputs, all_req_langs)
+    ]
 
     if any(all_return_ts):
         per_chunk_words = _align_chunks_safely(
@@ -732,19 +635,25 @@ def _prefetch_loop(
                 else:
                     raw_loaded.append((item, audios))
 
-            # Precompute shared Whisper mel features in parallel across 4 CPU threads
-            # while the GPU is busy running the previous super-batch!
+            # Precompute ForcedAligner Whisper mel features in parallel across 4 CPU threads
+            # while the GPU runs the previous super-batch (only for items requesting timestamps).
             loaded_items: List[
                 Tuple[Dict[str, Any], List[tuple], List[Optional[Tuple[Any, Any]]]]
             ] = []
             if backend != "mock" and feature_extractor is not None and raw_loaded:
-                flat_audios = [aud for _, auds in raw_loaded for aud in auds]
-                flat_mels = list(mel_pool.map(_extract_safe, flat_audios))
+                mel_tasks: List[tuple] = []
+                for item, auds in raw_loaded:
+                    if bool(item.get("return_timestamps", True)):
+                        mel_tasks.extend(auds)
+                flat_mels = list(mel_pool.map(_extract_safe, mel_tasks)) if mel_tasks else []
                 pos = 0
                 for item, auds in raw_loaded:
-                    cnt = len(auds)
-                    loaded_items.append((item, auds, flat_mels[pos : pos + cnt]))
-                    pos += cnt
+                    if bool(item.get("return_timestamps", True)):
+                        cnt = len(auds)
+                        loaded_items.append((item, auds, flat_mels[pos : pos + cnt]))
+                        pos += cnt
+                    else:
+                        loaded_items.append((item, auds, [None] * len(auds)))
             else:
                 for item, auds in raw_loaded:
                     loaded_items.append((item, auds, [None] * len(auds)))
