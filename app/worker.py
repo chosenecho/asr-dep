@@ -133,6 +133,34 @@ def _load_real_model(worker_cfg: Dict[str, Any], logger: logging.Logger) -> Any:
     raise ValueError(f"Unsupported backend: {backend}")
 
 
+def _extract_single_mel_feature(
+    feature_extractor: Any, wav_obj: Any
+) -> Tuple[Any, Any]:
+    """
+    Compute Whisper 128-bin log-mel features once on CPU (shared by BOTH vLLM and ForcedAligner).
+    Pads raw waveform to a multiple of hop_length (160) to match vLLM's Qwen3ASR processor.
+    """
+    import numpy as np
+
+    wav = wav_obj[0] if isinstance(wav_obj, tuple) else wav_obj
+    wav = np.asarray(wav, dtype=np.float32)
+    hop_length = int(getattr(feature_extractor, "hop_length", 160))
+    rem = wav.shape[-1] % hop_length
+    if rem != 0:
+        wav = np.pad(wav, (0, hop_length - rem), mode="constant", constant_values=0.0)
+
+    sr = int(getattr(feature_extractor, "sampling_rate", 16000))
+    feat_out = feature_extractor(
+        [wav],
+        sampling_rate=sr,
+        padding=True,
+        truncation=False,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    return feat_out["input_features"], feat_out["attention_mask"]
+
+
 def _align_chunks_safely(
     model: Any,
     audios: List[tuple],
@@ -143,11 +171,12 @@ def _align_chunks_safely(
     aligner_batch_size: int = 6,
     prep_executor: Optional[ThreadPoolExecutor] = None,
     return_ts_flags: Optional[List[bool]] = None,
+    precomputed_mels: Optional[List[Optional[Tuple[Any, Any]]]] = None,
 ) -> List[List[Dict[str, Any]]]:
     """
     Run Qwen3-ForcedAligner on alignable chunks using bounded sub-batches and
-    CPU/GPU pipelining (parallel Whisper mel preprocessing overlapped with GPU forward),
-    with per-chunk fallback so a single bad chunk can never crash a multi-hour job.
+    precomputed shared Whisper mel features (zero post-vLLM mel CPU stall),
+    with automatic fallback to CPU pipelined processor and per-chunk align().
     """
     n = len(texts)
     per_chunk_words: List[List[Dict[str, Any]]] = [[] for _ in range(n)]
@@ -160,6 +189,7 @@ def _align_chunks_safely(
     align_audios: List[tuple] = []
     align_texts: List[str] = []
     align_langs: List[str] = []
+    align_mels: List[Optional[Tuple[Any, Any]]] = []
 
     for i in range(n):
         if return_ts_flags is not None and not return_ts_flags[i]:
@@ -179,6 +209,7 @@ def _align_chunks_safely(
         align_audios.append(audios[i])
         align_texts.append(txt)
         align_langs.append(lang)
+        align_mels.append(precomputed_mels[i] if precomputed_mels is not None else None)
 
     if not align_indices:
         return per_chunk_words
@@ -229,6 +260,7 @@ def _align_chunks_safely(
             align_audios[pos : pos + step],
             align_texts[pos : pos + step],
             align_langs[pos : pos + step],
+            align_mels[pos : pos + step],
         )
         for pos in range(0, len(align_indices), step)
     ]
@@ -244,8 +276,54 @@ def _align_chunks_safely(
 
     if can_pipeline:
         import torch
+        from transformers.feature_extraction_utils import BatchFeature
+        from qwen_asr.core.transformers_backend.processing_qwen3_asr import (
+            Qwen3ASRProcessorKwargs,
+            _get_feat_extract_output_lengths,
+        )
 
-        def _prep_cpu(sub_audios_raw: List[Any], sub_input_texts: List[str]) -> Any:
+        text_kwargs = aligner.processor._merge_kwargs(
+            Qwen3ASRProcessorKwargs,
+            tokenizer_init_kwargs=aligner.processor.tokenizer.init_kwargs,
+            return_tensors="pt",
+            padding=True,
+        )["text_kwargs"]
+
+        def _prep_cpu(
+            sub_audios_raw: List[Any],
+            sub_input_texts: List[str],
+            sub_mels: List[Optional[Tuple[Any, Any]]],
+        ) -> Any:
+            if sub_mels and all(m is not None for m in sub_mels):
+                max_t = max(m[0].shape[-1] for m in sub_mels if m is not None)
+                feats = []
+                masks = []
+                for m in sub_mels:
+                    assert m is not None
+                    feat, mask = m
+                    pad = max_t - feat.shape[-1]
+                    if pad > 0:
+                        feat = torch.nn.functional.pad(feat, (0, pad), value=0.0)
+                        mask = torch.nn.functional.pad(mask, (0, pad), value=0)
+                    feats.append(feat)
+                    masks.append(mask)
+                audio_inputs = {
+                    "input_features": torch.cat(feats, dim=0),
+                    "feature_attention_mask": torch.cat(masks, dim=0),
+                }
+                audio_lengths = iter(
+                    _get_feat_extract_output_lengths(
+                        audio_inputs["feature_attention_mask"].sum(-1)
+                    )
+                )
+                rep_texts = aligner.processor.replace_multimodal_special_tokens(
+                    list(sub_input_texts), audio_lengths
+                )
+                text_inputs = aligner.processor.tokenizer(rep_texts, **text_kwargs)
+                return BatchFeature(
+                    data={**text_inputs, **audio_inputs},
+                    tensor_type="pt",
+                )
             return aligner.processor(
                 text=sub_input_texts,
                 audio=sub_audios_raw,
@@ -253,10 +331,10 @@ def _align_chunks_safely(
                 padding=True,
             )
 
-        # Encode timestamp text templates on main thread (<1ms), then dispatch CPU mel
-        # extraction for ALL sub-batches concurrently so GPU never stalls between sub-batches.
+        # Encode timestamp text templates on main thread (<1ms), then assemble tensors
+        # using already-precomputed mel spectrograms (or CPU mel fallback if unavailable).
         prepared_jobs = []
-        for sub_indices, sub_audios, sub_texts, sub_langs in sub_batches:
+        for sub_indices, sub_audios, sub_texts, sub_langs, sub_mels in sub_batches:
             try:
                 word_lists = []
                 input_texts = []
@@ -265,7 +343,7 @@ def _align_chunks_safely(
                     word_lists.append(wl)
                     input_texts.append(inp_txt)
                 raw_wavs = [a[0] if isinstance(a, tuple) else a for a in sub_audios]
-                fut = prep_executor.submit(_prep_cpu, raw_wavs, input_texts)
+                fut = prep_executor.submit(_prep_cpu, raw_wavs, input_texts, sub_mels)
                 prepared_jobs.append((sub_indices, sub_audios, sub_texts, sub_langs, word_lists, fut))
             except Exception as prep_err:
                 logger.warning(
@@ -313,7 +391,7 @@ def _align_chunks_safely(
                 _fallback_single(sub_indices, sub_audios, sub_texts, sub_langs)
         return per_chunk_words
 
-    for sub_indices, sub_audios, sub_texts, sub_langs in sub_batches:
+    for sub_indices, sub_audios, sub_texts, sub_langs, _ in sub_batches:
         try:
             aligned_batch = aligner.align(
                 audio=sub_audios,
@@ -371,32 +449,121 @@ def _process_mock_batch(work_item: Dict[str, Any]) -> List[Dict[str, Any]]:
     return results
 
 
+_VLLM_PRECOMPUTE_DISABLED = False
+
+
+def _infer_asr_vllm_precomputed(
+    model: Any,
+    all_contexts: List[str],
+    all_req_langs: List[Optional[str]],
+    all_mels: List[Optional[Tuple[Any, Any]]],
+    logger: logging.Logger,
+) -> Optional[Tuple[List[str], List[str]]]:
+    """
+    Feed already-precomputed Whisper mel features directly into vLLM via Qwen3ASR's
+    DictEmbeddingItems path, completely eliminating vLLM's synchronous CPU mel extraction gap.
+    Returns (texts, langs) or None if unavailable/failed so caller falls back to model.transcribe().
+    """
+    global _VLLM_PRECOMPUTE_DISABLED
+    if _VLLM_PRECOMPUTE_DISABLED:
+        return None
+    if getattr(model, "backend", None) != "vllm":
+        return None
+    if not all_mels or not all(m is not None for m in all_mels):
+        return None
+    if not hasattr(model, "_build_text_prompt") or not hasattr(model, "sampling_params"):
+        return None
+
+    try:
+        import torch
+        from qwen_asr.inference.utils import (
+            normalize_language_name,
+            parse_asr_output,
+            validate_language,
+        )
+
+        langs_norm: List[Optional[str]] = []
+        for l in all_req_langs:
+            if l is None or str(l).strip() == "":
+                langs_norm.append(None)
+            else:
+                ln = normalize_language_name(str(l))
+                validate_language(ln)
+                langs_norm.append(ln)
+
+        vllm_inputs: List[Dict[str, Any]] = []
+        for ctx, fl, mel in zip(all_contexts, langs_norm, all_mels):
+            assert mel is not None
+            feat, mask = mel
+            prompt = model._build_text_prompt(context=ctx, force_language=fl)
+            input_audio_features = (
+                feat.permute(0, 2, 1)[mask.bool()].permute(1, 0).contiguous()
+            )
+            audio_feature_lengths = mask.sum(-1).to(dtype=torch.long)
+            vllm_inputs.append(
+                {
+                    "prompt": prompt,
+                    "multi_modal_data": {
+                        "audio": {
+                            "input_audio_features": input_audio_features,
+                            "audio_feature_lengths": audio_feature_lengths,
+                        }
+                    },
+                }
+            )
+
+        raw_outputs = model.model.generate(
+            vllm_inputs,
+            sampling_params=model.sampling_params,
+            use_tqdm=False,
+        )
+
+        texts: List[str] = []
+        langs: List[str] = []
+        for out_obj, forced_lang, orig_req in zip(raw_outputs, langs_norm, all_req_langs):
+            raw_txt = out_obj.outputs[0].text
+            pred_lang, pred_txt = parse_asr_output(raw_txt, user_language=forced_lang)
+            texts.append(pred_txt or "")
+            langs.append(pred_lang or (orig_req or ""))
+        return texts, langs
+    except Exception as exc:
+        _VLLM_PRECOMPUTE_DISABLED = True
+        logger.warning(
+            "Precomputed-mel vLLM fast path unavailable (%s); falling back to model.transcribe().",
+            exc,
+        )
+        return None
+
+
 def _process_real_superbatch(
     model: Any,
-    loaded_items: List[Tuple[Dict[str, Any], List[tuple]]],
+    loaded_items: List[Tuple[Dict[str, Any], List[tuple], List[Optional[Tuple[Any, Any]]]]],
     logger: logging.Logger,
     aligner_batch_size: int,
     prep_executor: ThreadPoolExecutor,
 ) -> List[Tuple[str, List[Dict[str, Any]]]]:
     """
-    Run ONE coalesced vLLM ASR pass across chunks from multiple concurrent jobs,
-    followed by pipelined sub-batch ForcedAligner, then split results per batch_id.
+    Run ONE coalesced vLLM ASR pass across chunks from multiple concurrent jobs
+    using precomputed shared mel features, followed by zero-mel ForcedAligner,
+    then split results per batch_id.
     """
     all_audios: List[tuple] = []
+    all_mels: List[Optional[Tuple[Any, Any]]] = []
     all_contexts: List[str] = []
     all_req_langs: List[Optional[str]] = []
     all_offsets: List[float] = []
     all_return_ts: List[bool] = []
     slices: List[Tuple[Dict[str, Any], int, int]] = []
 
-    for work_item, item_audios in loaded_items:
+    for work_item, item_audios, item_mels in loaded_items:
         chunks = work_item["chunks"]
         req_lang = normalize_requested_language(work_item.get("language"))
         context = work_item.get("context") or ""
         return_ts = bool(work_item.get("return_timestamps", True))
         start_idx = len(all_audios)
-        for ch, aud in zip(chunks, item_audios):
+        for ch, aud, mel in zip(chunks, item_audios, item_mels):
             all_audios.append(aud)
+            all_mels.append(mel)
             all_contexts.append(context)
             all_req_langs.append(req_lang)
             all_offsets.append(float(ch["start_sec"]))
@@ -406,17 +573,26 @@ def _process_real_superbatch(
     if not all_audios:
         return [(wi["batch_id"], []) for wi, _, _ in slices]
 
-    asr_outputs = model.transcribe(
-        audio=all_audios,
-        context=all_contexts,
-        language=all_req_langs,
-        return_time_stamps=False,
+    fast_res = _infer_asr_vllm_precomputed(
+        model=model,
+        all_contexts=all_contexts,
+        all_req_langs=all_req_langs,
+        all_mels=all_mels,
+        logger=logger,
     )
-
-    texts = [r.text or "" for r in asr_outputs]
-    langs = [
-        (r.language or (req_l or "")) for r, req_l in zip(asr_outputs, all_req_langs)
-    ]
+    if fast_res is not None:
+        texts, langs = fast_res
+    else:
+        asr_outputs = model.transcribe(
+            audio=all_audios,
+            context=all_contexts,
+            language=all_req_langs,
+            return_time_stamps=False,
+        )
+        texts = [r.text or "" for r in asr_outputs]
+        langs = [
+            (r.language or (req_l or "")) for r, req_l in zip(asr_outputs, all_req_langs)
+        ]
 
     if any(all_return_ts):
         per_chunk_words = _align_chunks_safely(
@@ -429,6 +605,7 @@ def _process_real_superbatch(
             aligner_batch_size=aligner_batch_size,
             prep_executor=prep_executor,
             return_ts_flags=all_return_ts,
+            precomputed_mels=all_mels,
         )
     else:
         per_chunk_words = [[] for _ in all_audios]
@@ -459,23 +636,28 @@ def _process_real_superbatch(
 
 def _prefetch_loop(
     work_queue: Any,
-    prefetch_queue: "queue.Queue[Optional[Tuple[List[Tuple[Dict[str, Any], List[tuple]]], List[Tuple[str, str]]]]]",
+    prefetch_queue: Any,
     backend: str,
     max_batch: int,
     num_workers: int,
     coalesce_wait_sec: float,
+    feature_extractor: Any,
     logger: logging.Logger,
 ) -> None:
     """
     Background producer inside each GPU worker:
     1. Coalesces queued mini-batches across concurrent jobs up to `max_batch` chunks.
-    2. Preloads WAV chunks from disk into RAM in parallel WHILE GPU runs the previous batch.
+    2. Preloads WAV chunks AND precomputes Whisper 128-bin mel features ONCE in parallel
+       on CPU threads WHILE the GPU executes the previous super-batch.
     """
     overflow_item: Optional[Dict[str, Any]] = None
     shutdown_pending = False
     io_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wav-prefetch")
+    mel_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mel-prefetch")
 
-    def _load_item(item: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[List[tuple]], Optional[str]]:
+    def _load_item(
+        item: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Optional[List[tuple]], Optional[str]]:
         if backend == "mock":
             return item, [], None
         try:
@@ -483,6 +665,13 @@ def _prefetch_loop(
             return item, audios, None
         except Exception as exc:
             return item, None, str(exc)
+
+    def _extract_safe(aud: tuple) -> Optional[Tuple[Any, Any]]:
+        try:
+            return _extract_single_mel_feature(feature_extractor, aud)
+        except Exception as exc:
+            logger.debug("Precompute mel failed for chunk (%s); will compute on demand.", exc)
+            return None
 
     try:
         while True:
@@ -527,7 +716,7 @@ def _prefetch_loop(
                     overflow_item = nxt
                     break
 
-            loaded_items: List[Tuple[Dict[str, Any], List[tuple]]] = []
+            raw_loaded: List[Tuple[Dict[str, Any], List[tuple]]] = []
             failed_items: List[Tuple[str, str]] = []
 
             if len(items) == 1:
@@ -540,11 +729,29 @@ def _prefetch_loop(
                     logger.warning("Failed to preload WAV for batch %s: %s", item.get("batch_id"), err)
                     failed_items.append((item["batch_id"], err or "WAV preload failed"))
                 else:
-                    loaded_items.append((item, audios))
+                    raw_loaded.append((item, audios))
+
+            # Precompute shared Whisper mel features in parallel across 4 CPU threads
+            # while the GPU is busy running the previous super-batch!
+            loaded_items: List[
+                Tuple[Dict[str, Any], List[tuple], List[Optional[Tuple[Any, Any]]]]
+            ] = []
+            if backend != "mock" and feature_extractor is not None and raw_loaded:
+                flat_audios = [aud for _, auds in raw_loaded for aud in auds]
+                flat_mels = list(mel_pool.map(_extract_safe, flat_audios))
+                pos = 0
+                for item, auds in raw_loaded:
+                    cnt = len(auds)
+                    loaded_items.append((item, auds, flat_mels[pos : pos + cnt]))
+                    pos += cnt
+            else:
+                for item, auds in raw_loaded:
+                    loaded_items.append((item, auds, [None] * len(auds)))
 
             prefetch_queue.put((loaded_items, failed_items))
     finally:
         io_pool.shutdown(wait=False)
+        mel_pool.shutdown(wait=False)
 
 
 def gpu_worker_main(
@@ -589,9 +796,12 @@ def gpu_worker_main(
         )
         return
 
-    prefetch_queue: "queue.Queue[Optional[Tuple[List[Tuple[Dict[str, Any], List[tuple]]], List[Tuple[str, str]]]]]" = queue.Queue(
-        maxsize=1
+    feature_extractor = (
+        getattr(getattr(model, "processor", None), "feature_extractor", None)
+        if model is not None
+        else None
     )
+    prefetch_queue: Any = queue.Queue(maxsize=1)
     prefetch_thread = threading.Thread(
         target=_prefetch_loop,
         args=(
@@ -601,6 +811,7 @@ def gpu_worker_main(
             max_batch,
             num_workers,
             coalesce_wait_sec,
+            feature_extractor,
             logger,
         ),
         name=f"gpu-{gpu_id}-prefetcher",
@@ -631,7 +842,7 @@ def gpu_worker_main(
                 continue
 
             if backend == "mock":
-                for work_item, _ in loaded_items:
+                for work_item, _, _ in loaded_items:
                     batch_id = work_item["batch_id"]
                     try:
                         chunk_results = _process_mock_batch(work_item)
