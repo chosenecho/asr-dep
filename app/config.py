@@ -77,6 +77,34 @@ class Settings(BaseSettings):
         le=8192,
         description="Max generated tokens per audio chunk (2048 comfortably covers 120-150s speech)",
     )
+    vllm_max_model_len: int | None = Field(
+        default=None,
+        ge=2048,
+        le=65536,
+        description="Optional vLLM max_model_len override (e.g. 16384 on 24GB L4/4090 to reduce minimum KV cache)",
+    )
+    vllm_enforce_eager: bool = Field(
+        default=False,
+        description="Disable vLLM torch.compile and CUDA Graph capture (faster cold start without GPU snapshots)",
+    )
+    vllm_cudagraph_mode: str = Field(
+        default="",
+        description="Optional vLLM CompilationConfig.cudagraph_mode override (e.g. FULL_DECODE_ONLY, PIECEWISE, FULL, NONE)",
+    )
+    vllm_cudagraph_capture_sizes: str = Field(
+        default="",
+        description="Optional comma-separated CUDA Graph batch sizes (e.g. '1,2,4,8,16') to trim capture time and VRAM/snapshot size",
+    )
+    vllm_compilation_mode: int | None = Field(
+        default=None,
+        ge=0,
+        le=3,
+        description="Optional vLLM CompilationMode override (0=NONE, 1=STOCK_TORCH_COMPILE, 2=DYNAMO_TRACE_ONCE, 3=VLLM_COMPILE)",
+    )
+    warmup_on_startup: bool = Field(
+        default=False,
+        description="Run a lightweight ASR + ForcedAligner + Silero VAD warmup pass on startup before reporting ready",
+    )
     chunks_per_dispatch: int = Field(
         default=6,
         ge=1,

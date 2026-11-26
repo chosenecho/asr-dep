@@ -29,6 +29,8 @@ X-API-Key: <API_KEY>
 }
 ```
 
+> **Modal Serverless 边缘代理鉴权说明**：若通过 [`deploy/modal_app.py`](../deploy/modal_app.py) 部署并保持默认 `REQUIRES_PROXY_AUTH = True`，所有请求（包括 `GET /health`）还需在请求头中附带 `Modal-Key` 与 `Modal-Secret`，未通过边缘网关校验的请求会直接返回 `401` 且不会唤醒 GPU 容器。详见 [部署与运维指南 §7.2](DEPLOYMENT.md#72-modal-边缘网关代理鉴权requires_proxy_authtrue)。
+
 ---
 
 ## 2. 接口总览

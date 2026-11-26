@@ -81,6 +81,97 @@ def normalize_requested_language(lang: Optional[str]) -> Optional[str]:
     return raw[:1].upper() + raw[1:].lower()
 
 
+def _build_vllm_compilation_config(
+    worker_cfg: Dict[str, Any],
+    logger: logging.Logger,
+) -> Optional[Dict[str, Any]]:
+    """Build optional vLLM CompilationConfig dict for trimmed CUDA Graph capture."""
+    comp_cfg: Dict[str, Any] = {}
+
+    comp_mode = worker_cfg.get("vllm_compilation_mode")
+    if comp_mode is not None and str(comp_mode).strip() != "":
+        comp_cfg["mode"] = int(comp_mode)
+
+    cg_mode = str(worker_cfg.get("vllm_cudagraph_mode") or "").strip().upper()
+    if cg_mode:
+        comp_cfg["cudagraph_mode"] = cg_mode
+
+    cg_sizes_raw = str(worker_cfg.get("vllm_cudagraph_capture_sizes") or "").strip()
+    if cg_sizes_raw:
+        sizes: List[int] = []
+        for token in cg_sizes_raw.split(","):
+            tok = token.strip()
+            if not tok:
+                continue
+            val = int(tok)
+            if val <= 0:
+                raise ValueError(f"Invalid vllm_cudagraph_capture_sizes entry: {tok!r}")
+            sizes.append(val)
+        if sizes:
+            comp_cfg["cudagraph_capture_sizes"] = sorted(set(sizes))
+
+    if comp_cfg:
+        logger.info("Applying vLLM compilation_config=%s", comp_cfg)
+        return comp_cfg
+    return None
+
+
+def _warmup_real_model(
+    model: Any,
+    aligner_batch_size: int,
+    prep_executor: ThreadPoolExecutor,
+    logger: logging.Logger,
+) -> None:
+    """
+    Force lazy CUDA / Triton / FlashAttn / cuBLAS initialization for BOTH
+    Qwen3-ASR (vLLM) and Qwen3-ForcedAligner before reporting healthy or taking
+    a GPU memory snapshot.
+    """
+    import numpy as np
+    import torch
+
+    t0 = time.perf_counter()
+    sr = 16000
+    t = np.arange(sr, dtype=np.float32) / float(sr)
+    # 1.0s gentle 440Hz tone (non-zero energy so mel/feature extractors hit normal paths)
+    wav = (0.05 * np.sin(2.0 * np.pi * 440.0 * t)).astype(np.float32)
+    dummy_audio = (wav, sr)
+
+    logger.info("Running startup GPU warmup for Qwen3-ASR + ForcedAligner...")
+    model.transcribe(
+        audio=[dummy_audio],
+        context=[""],
+        language=["English"],
+        return_time_stamps=False,
+    )
+
+    if getattr(model, "forced_aligner", None) is not None:
+        feature_extractor = getattr(getattr(model, "processor", None), "feature_extractor", None)
+        mel = (
+            _extract_single_mel_feature(feature_extractor, dummy_audio)
+            if feature_extractor is not None
+            else None
+        )
+        _align_chunks_safely(
+            model=model,
+            audios=[dummy_audio],
+            texts=["hello world"],
+            langs=["English"],
+            offsets=[0.0],
+            logger=logger,
+            aligner_batch_size=aligner_batch_size,
+            prep_executor=prep_executor,
+            return_ts_flags=[True],
+            precomputed_mels=[mel],
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    logger.info("Startup GPU warmup finished in %.2fs.", time.perf_counter() - t0)
+
+
 def _load_real_model(worker_cfg: Dict[str, Any], logger: logging.Logger) -> Any:
     import torch
     from qwen_asr import Qwen3ASRModel
@@ -108,14 +199,25 @@ def _load_real_model(worker_cfg: Dict[str, Any], logger: logging.Logger) -> Any:
     )
 
     if backend == "vllm":
-        return Qwen3ASRModel.LLM(
-            model=asr_model_path,
-            gpu_memory_utilization=float(worker_cfg["gpu_memory_utilization"]),
-            max_inference_batch_size=int(worker_cfg["max_inference_batch_size"]),
-            max_new_tokens=int(worker_cfg["max_new_tokens"]),
-            forced_aligner=aligner_path,
-            forced_aligner_kwargs=aligner_kwargs,
-        )
+        enforce_eager = bool(worker_cfg.get("vllm_enforce_eager", False))
+        vllm_kwargs: Dict[str, Any] = {
+            "model": asr_model_path,
+            "gpu_memory_utilization": float(worker_cfg["gpu_memory_utilization"]),
+            "max_inference_batch_size": int(worker_cfg["max_inference_batch_size"]),
+            "max_new_tokens": int(worker_cfg["max_new_tokens"]),
+            "forced_aligner": aligner_path,
+            "forced_aligner_kwargs": aligner_kwargs,
+        }
+        if worker_cfg.get("vllm_max_model_len"):
+            vllm_kwargs["max_model_len"] = int(worker_cfg["vllm_max_model_len"])
+        if enforce_eager:
+            logger.info("Enabling vLLM enforce_eager=True (CUDA Graphs & torch.compile disabled).")
+            vllm_kwargs["enforce_eager"] = True
+        else:
+            comp_cfg = _build_vllm_compilation_config(worker_cfg, logger)
+            if comp_cfg is not None:
+                vllm_kwargs["compilation_config"] = comp_cfg
+        return Qwen3ASRModel.LLM(**vllm_kwargs)
 
     if backend == "transformers":
         tf_kwargs: Dict[str, Any] = {
@@ -689,13 +791,22 @@ def gpu_worker_main(
     logger = logging.getLogger(f"asr.worker.{gpu_id}")
 
     model = None
+    align_prep_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"gpu-{gpu_id}-alignprep")
     try:
         if backend != "mock":
             model = _load_real_model(worker_cfg, logger)
+            if bool(worker_cfg.get("warmup_on_startup", False)):
+                _warmup_real_model(
+                    model=model,
+                    aligner_batch_size=aligner_batch_size,
+                    prep_executor=align_prep_pool,
+                    logger=logger,
+                )
         else:
             logger.info("Mock worker initialized for GPU slot %s.", gpu_id)
         ready_queue.put({"gpu_id": gpu_id, "status": "ready", "pid": os.getpid()})
     except Exception as exc:
+        align_prep_pool.shutdown(wait=False)
         logger.exception("Failed to initialize worker on GPU %s", gpu_id)
         ready_queue.put(
             {
@@ -729,7 +840,6 @@ def gpu_worker_main(
     )
     prefetch_thread.start()
 
-    align_prep_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"gpu-{gpu_id}-alignprep")
     try:
         while True:
             bundle = prefetch_queue.get()

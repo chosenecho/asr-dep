@@ -7,7 +7,7 @@
 ## 文档导航
 
 - [API 参考文档](docs/API.md)：全部接口说明、请求/响应示例、OpenAI 兼容层、Webhook 回调与错误码
-- [部署与运维指南](docs/DEPLOYMENT.md)：软硬件依赖、完整环境变量表、Docker/Nginx/HTTPS、systemd 裸机部署、显存调优与排障
+- [部署与运维指南](docs/DEPLOYMENT.md)：软硬件依赖、完整环境变量表、Docker/Nginx/HTTPS、systemd 裸机、**Modal Serverless GPU（显存快照冷启优化 + 边缘代理鉴权）**、显存调优与排障
 - [系统架构设计](docs/ARCHITECTURE.md)：多卡数据并行原理、长录音零 OOM 流式链路、时间戳对齐机制与项目目录结构
 
 ## 核心架构特性
@@ -30,6 +30,10 @@
   - 短/中音频同步 API（`POST /v1/asr/transcribe`，支持直接返回 `json` / `text` / `srt` / `vtt`）；
   - OpenAI Whisper 兼容接口（`POST /v1/audio/transcriptions`，支持 `verbose_json` / `srt` / `vtt`）；
   - API Key 鉴权（`Authorization: Bearer` 或 `X-API-Key`）、Webhook SSRF 防护、Nginx 大文件反向代理配置。
+- **开箱即用的 Serverless GPU 部署（[deploy/modal_app.py](deploy/modal_app.py)）**：
+  - 面向 NVIDIA L4 (24GB) 原版 BF16 权重深度优化，闲时自动缩容至 0（`min_containers=0`，`scaledown_window=60s`）；
+  - 集成 **Modal CPU + GPU 显存快照**、**快照前全链路预热**、**持久化 `/cache` JIT 编译缓存 Volume** 与 **裁剪版 Decode-Only CUDA Graph**，实测从 0 唤醒恢复时间由 `129.8s` 降至 **`22.2s`**（约 `5.8×` 提速），恢复后首包推理零编译卡顿；
+  - 默认启用 **Modal 边缘网关代理鉴权**（`requires_proxy_auth=True`），缺失或错误的 `Modal-Key` / `Modal-Secret` 在边缘代理层直接返回 `401`，不唤醒 GPU 容器（算力消耗 `$0`）。
 
 ## 实际性能参考（单卡 RTX 4080 SUPER 32GB，全量 ForcedAligner 词/句对齐）
 
@@ -48,6 +52,41 @@
 | :--- | :--- | :--- |
 | **RTX 4080 SUPER / 32GB** | `GPU_MEMORY_UTILIZATION=0.58`<br>`MAX_INFERENCE_BATCH_SIZE=24`<br>`ALIGNER_BATCH_SIZE=6` | vLLM 预留 ~19GB，余量给 ForcedAligner 与激活峰值，8 并发稳定无 OOM |
 | **RTX 4090 / 24GB（单卡或双卡）** | `GPU_MEMORY_UTILIZATION=0.62`<br>`MAX_INFERENCE_BATCH_SIZE=16`<br>`ALIGNER_BATCH_SIZE=6` | 双卡设 `GPU_IDS=0,1` 即可线性翻倍吞吐 |
+| **NVIDIA L4 / 24GB（Modal Serverless）** | `GPU_MEMORY_UTILIZATION=0.58`<br>`VLLM_MAX_MODEL_LEN=16384`<br>`MAX_INFERENCE_BATCH_SIZE=16`<br>`VLLM_CUDAGRAPH_MODE=FULL_DECODE_ONLY`<br>`VLLM_CUDAGRAPH_CAPTURE_SIZES=1,2,4,8,16`<br>`WARMUP_ON_STARTUP=true` | 配合 GPU 显存快照冷启恢复 `~22.2s`，原版 BF16 权重全功能运行 |
+
+---
+
+## Serverless GPU 部署（Modal，闲时自动缩容到 0）
+
+若业务属于间歇性/突发流量，不希望长期包月租卡，可直接使用仓库内置的 [deploy/modal_app.py](deploy/modal_app.py) 一键部署到 [Modal](https://modal.com)（单卡 NVIDIA L4 24GB，原版 BF16 精度，闲时 60 秒自动缩容到 0）：
+
+```bash
+# 1. 安装并登录 Modal CLI
+pip install -U modal
+modal setup
+
+# 2. 创建业务 API Key Secret（默认读取 qwen-api-key，可通过环境变量 MODAL_API_SECRET_NAME 覆盖）
+modal secret create qwen-api-key API_KEYS=sk-your-strong-secret-key
+
+# 3. 一次性将 BF16 模型权重预下载到 Modal Volume（约 6.2 GB）
+modal run deploy/modal_app.py::download_models
+
+# 4. 部署 Serverless HTTPS 服务（开启 GPU 显存快照 + 边缘网关代理鉴权）
+modal deploy deploy/modal_app.py
+```
+
+默认开启 `requires_proxy_auth=True` 边缘网关防刷保护：在 Modal 控制台 **Settings → Proxy Auth Tokens** 创建 `Modal-Key` (`wk-...`) 与 `Modal-Secret` (`ws-...`) 后携带请求头访问：
+
+```bash
+curl -X POST "https://<your-modal-workspace>--qwen3-asr-server-serve.modal.run/v1/asr/transcribe" \
+  -H "Modal-Key: wk-..." \
+  -H "Modal-Secret: ws-..." \
+  -H "Authorization: Bearer sk-your-strong-secret-key" \
+  -F "file=@sample.wav" \
+  -F "return_timestamps=true"
+```
+
+> 完整的冷启动优化原理、实测数据、OpenAI SDK 自定义 Header 配置以及关闭边缘代理鉴权的方法，详见 [部署与运维指南 §7](docs/DEPLOYMENT.md#7-modal-serverless-gpu-部署闲时缩容到-0)。
 
 ---
 

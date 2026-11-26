@@ -23,7 +23,7 @@ from app.audio import (
     read_chunk_waveform,
     read_chunks_from_wav,
 )
-from app.worker import normalize_requested_language
+from app.worker import _build_vllm_compilation_config, normalize_requested_language
 
 
 def test_low_energy_chunking_snaps_to_silence_and_preserves_all_frames(tmp_path: Path) -> None:
@@ -208,3 +208,23 @@ def test_helpers() -> None:
     assert normalize_requested_language("zh") == "Chinese"
     assert normalize_requested_language("en") == "English"
     assert normalize_requested_language("auto") is None
+
+
+def test_build_vllm_compilation_config() -> None:
+    import logging
+
+    log = logging.getLogger("test.vllm.compile")
+    assert _build_vllm_compilation_config({}, log) is None
+    cfg = _build_vllm_compilation_config(
+        {
+            "vllm_cudagraph_mode": "full_decode_only",
+            "vllm_cudagraph_capture_sizes": "8, 1, 4, 2, 16, 4",
+            "vllm_compilation_mode": 3,
+        },
+        log,
+    )
+    assert cfg == {
+        "mode": 3,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": [1, 2, 4, 8, 16],
+    }

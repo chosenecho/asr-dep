@@ -1,6 +1,6 @@
 # 部署与运维指南
 
-本文档面向在 Linux GPU 服务器（单卡 32GB RTX 4080 SUPER / 5090、单/双路 24GB RTX 4090、或云端容器实例如 AutoDL）上部署与运维 `qwen3-asr-server` 的场景，涵盖环境准备、Docker / 裸机 / 云端数据盘部署、完整环境变量表、高并发调优与故障排查。
+本文档面向在 Linux GPU 服务器（单卡 32GB RTX 4080 SUPER / 5090、单/双路 24GB RTX 4090）、云端容器实例（如 AutoDL）以及 **Modal Serverless GPU（NVIDIA L4 24GB，闲时缩容到 0）** 上部署与运维 `qwen3-asr-server` 的场景，涵盖环境准备、Docker / 裸机 / 云端数据盘 / Modal 部署、完整环境变量表、冷启动优化、高并发调优与故障排查。
 
 ---
 
@@ -83,6 +83,12 @@ cp .env.example .env
 | `BATCH_COALESCE_WAIT_MS` | `15`（高并发长录音推荐 `40`） | 单卡 Worker 跨任务合批最大等待窗口（毫秒，`0 ~ 500`） |
 | `USE_FLASH_ATTENTION` | `false` | 是否为 ForcedAligner / Transformers 显式启用 `flash_attention_2`（PyTorch 2.x 默认 SDPA 已走 Flash 内核） |
 | `WORKER_STARTUP_TIMEOUT_SEC` | `300` | 启动时等待所有 GPU Worker 加载模型的超时时间（秒） |
+| `VLLM_MAX_MODEL_LEN` | `None` | 可选：覆盖 vLLM `max_model_len`（`2048 ~ 65536`）；如 24GB L4/4090 上设 `16384` 可收缩最小 KV Cache 占用，给 ForcedAligner 留出安全显存余量 |
+| `VLLM_ENFORCE_EAGER` | `false` | 设为 `true` 时关闭 vLLM `torch.compile` 与 CUDA Graph 捕获；适合未开启 GPU 快照时的快速冷启动 |
+| `VLLM_CUDAGRAPH_MODE` | `""` | 可选：覆盖 vLLM `compilation_config.cudagraph_mode`（如 `FULL_DECODE_ONLY`、`PIECEWISE`、`FULL`、`NONE`） |
+| `VLLM_CUDAGRAPH_CAPTURE_SIZES` | `""` | 可选：英文逗号分隔的 CUDA Graph 录制 Batch Size 列表（如 `1,2,4,8,16`），用于裁剪捕获耗时与 GPU 快照体积 |
+| `VLLM_COMPILATION_MODE` | `None` | 可选：覆盖 vLLM `compilation_config.mode`（`0=NONE`、`1=STOCK_TORCH_COMPILE`、`2=DYNAMO_TRACE_ONCE`、`3=VLLM_COMPILE`） |
+| `WARMUP_ON_STARTUP` | `false` | 设为 `true` 时在 Worker 报告就绪前自动跑一遍轻量级 ASR + ForcedAligner + Silero VAD 预热，提前完成 CUDA / Triton / ONNX 首次编译 |
 
 ### 3.3 长录音切分、并发控制与持久化
 | 变量名 | 代码默认值 | 说明 |
@@ -221,17 +227,119 @@ ssh -N -L 127.0.0.1:6006:127.0.0.1:6006 -o ExitOnForwardFailure=yes -o ServerAli
 
 ---
 
-## 7. 显存与高并发调优预设
+## 7. Modal Serverless GPU 部署（闲时缩容到 0）
+
+仓库内置了生产级 Serverless 部署脚本 [`deploy/modal_app.py`](../deploy/modal_app.py)，默认在单张 **NVIDIA L4 (24GB)** 上以 **原版 BF16 权重**（`Qwen3-ASR-1.7B` + `Qwen3-ForcedAligner-0.6B`）全功能运行，闲时自动缩容到 `0`，按实际请求秒级计费。
+
+### 7.1 前置准备与一键部署
+
+```bash
+# 1. 安装并登录 Modal CLI（建议使用 modal >= 1.6）
+pip install -U modal
+modal setup
+
+# 2. 创建业务 API Key Secret（应用内校验 Authorization: Bearer / X-API-Key）
+#    默认读取名为 qwen-api-key 的 Secret（兼容键名：API_KEYS / QWEN_API_KEY / SGLANG_API_KEY / API_KEY）
+#    如需使用自定义 Secret 名称，可在部署前设置环境变量：export MODAL_API_SECRET_NAME=my-asr-secret
+modal secret create qwen-api-key API_KEYS=sk-your-strong-secret-key
+
+# 3. 一次性预下载 BF16 权重到同区域持久化 Volume `qwen3-asr-weights`（约 6.2 GB）
+modal run deploy/modal_app.py::download_models
+
+# 4. 部署 Serverless HTTPS 服务
+modal deploy deploy/modal_app.py
+```
+
+部署完成后，Modal 会输出形如 `https://<your-workspace>--qwen3-asr-server-serve.modal.run` 的 HTTPS 访问地址。
+
+### 7.2 Modal 边缘网关代理鉴权（`requires_proxy_auth=True`）
+
+`deploy/modal_app.py` 默认开启了 Modal 原生边缘代理鉴权：
+
+```python
+REQUIRES_PROXY_AUTH = True
+
+@modal.web_server(
+    port=SERVER_PORT,
+    startup_timeout=300,
+    label=ENDPOINT_LABEL,
+    requires_proxy_auth=REQUIRES_PROXY_AUTH,
+)
+```
+
+- **核心收益（防刷防唤醒）**：缺失或错误的 `Modal-Key` / `Modal-Secret` 请求会在 Modal 边缘网关层直接被拦截并返回 `401 Unauthorized`，**完全不会唤醒 GPU 容器，产生 `$0` 算力费用**。
+- **如何获取 Token**：在 Modal 控制台进入 **Settings → Proxy Auth Tokens**，创建一对 `Modal-Key`（`wk-...`）与 `Modal-Secret`（`ws-...`）。
+- **调用方式**（注意：开启代理鉴权后，包括 `GET /health` 在内的所有路径均需携带 `Modal-Key` 和 `Modal-Secret`）：
+
+```bash
+# 健康检查（边缘代理层鉴权）
+curl "https://<your-workspace>--qwen3-asr-server-serve.modal.run/health" \
+  -H "Modal-Key: wk-..." \
+  -H "Modal-Secret: ws-..."
+
+# 同步转写（边缘代理鉴权 + 应用层 API Key 双重保护）
+curl -X POST "https://<your-workspace>--qwen3-asr-server-serve.modal.run/v1/asr/transcribe" \
+  -H "Modal-Key: wk-..." \
+  -H "Modal-Secret: ws-..." \
+  -H "Authorization: Bearer sk-your-strong-secret-key" \
+  -F "file=@sample.wav" \
+  -F "return_timestamps=true" \
+  -F "include_words=true"
+```
+
+使用 OpenAI Python SDK 时，可通过 `default_headers` 透传边缘鉴权头：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://<your-workspace>--qwen3-asr-server-serve.modal.run/v1",
+    api_key="sk-your-strong-secret-key",
+    default_headers={
+        "Modal-Key": "wk-...",
+        "Modal-Secret": "ws-...",
+    },
+)
+```
+
+> **第三方客户端兼容性说明**：如果使用的标准 OpenAI 桌面/Web 客户端（如部分未提供自定义 Header 入口的客户端）无法附加 `Modal-Key` 和 `Modal-Secret`，可将 `deploy/modal_app.py` 顶部的 `REQUIRES_PROXY_AUTH` 改为 `False` 并重新执行 `modal deploy deploy/modal_app.py`。关闭后仍由服务内置的 `API_KEYS` 保护所有 `/v1/*` 接口，但未授权请求会先唤醒容器再返回 `401`。
+
+### 7.3 冷启动优化策略与实测数据（NVIDIA L4 24GB，BF16）
+
+`deploy/modal_app.py` 综合了 6 项面向 Serverless GPU 的冷启动优化：
+
+1. **CPU + GPU 显存快照（核心）**：启用 `enable_memory_snapshot=True` + `experimental_options={"enable_gpu_snapshot": True}`，并在 `@modal.enter(snap=True)` 中完成模型加载、CUDA 初始化、KV Cache 分配与预热；后续从 0 缩容再唤醒时直接反序列化显存快照，跳过读盘与初始化。
+2. **快照前全链路预热**：Worker 启动阶段开启 `WARMUP_ON_STARTUP=true` 预热 `Qwen3-ASR-1.7B`、`Qwen3-ForcedAligner-0.6B` 与多线程 Silero VAD ONNX；随后 `deploy/modal_app.py` 再向本地 `127.0.0.1:8000/v1/asr/transcribe` 发起一次真实 WAV 端到端 HTTP 预热请求，逼迫所有 CUDA / Triton / FlashInfer / ffmpeg 路径在拍快照前完成初始化，消除恢复后首包编译卡顿。
+3. **持久化 JIT 编译缓存 Volume（`/cache`）**：挂载独立 Volume `qwen3-asr-cache` 到 `/cache`，将 `VLLM_CACHE_ROOT`、`TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR`、`FLASHINFER_WORKSPACE_BASE`、`CUDA_CACHE_PATH` 全部持久化并在预热完成后同步 `cache_vol.commit()`，即使换镜像或快照失效也能大幅缩短兜底冷启时间。
+4. **裁剪版 Decode-Only CUDA Graph**：开启快照时使用 `VLLM_CUDAGRAPH_MODE=FULL_DECODE_ONLY` 与 `VLLM_CUDAGRAPH_CAPTURE_SIZES=1,2,4,8,16`（仅录制 5 张小/中批 Decode 图，实测捕获仅耗时 ~2s、显存 ~0.04 GiB），兼顾快照体积与推理速度；若关闭快照（`ENABLE_GPU_SNAPSHOT = False`），自动降级为 `VLLM_ENFORCE_EAGER=true`。
+5. **原版 BF16 单卡权重 + 进程内 EngineCore**：原版 BF16 权重（约 6.2 GB）预存于同区域 Volume `qwen3-asr-weights`（`/models`），启动零公网拉取；同时设置 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 在独立 GPU Worker 内直接运行 vLLM V1 EngineCore，减少跨进程 IPC 与快照复杂度。
+6. **短窗口保活（`SCALEDOWN_WINDOW_SECONDS = 60`）**：连续调用或异步任务轮询在 60 秒窗口内复用热容器，空闲后自动缩容到 0。
+
+在 NVIDIA L4 (24GB) 上使用原版 BF16 权重 + 全量 ForcedAligner 的实测耗时对比：
+
+| 阶段 / 场景 | 实测耗时 | 说明 |
+| :--- | :---: | :--- |
+| 未优化冷启（无快照、无 `/cache` 缓存） | `~129.8s` | 每次重新加载权重、编译算子并录制完整图 |
+| 兜底冷启（快照失效，命中 `/cache` Volume） | `~86.7s` | 复用持久化 JIT 编译缓存，跳过算子重编译 |
+| **开启 GPU 显存快照从 0 唤醒恢复** | **`~22.2s`** | **相比基线提速约 `5.8×`**，直接恢复已预热显存状态 |
+| 快照恢复后首条真实音频推理（含 37 词对齐） | **`~1.6s`** | 零首次 JIT 卡顿，直接命中热内核与 Decode CUDA Graph |
+
+> **Serverless 异步任务提示**：Modal 容器内的 `/tmp/qwen3_asr_data`（SQLite 任务表）随容器缩容到 0 而回收。中短音频（≤ 600s）建议直接使用同步接口 `POST /v1/asr/transcribe` 或 `POST /v1/audio/transcriptions`；长录音使用异步接口 `POST /v1/asr/tasks` 时，请在任务完成后及时取回结果（或配合 `webhook_url` 自动推送），避免容器缩容后记录丢失。
+
+---
+
+## 8. 显存与高并发调优预设
 
 | 硬件与业务场景 | 推荐参数组合 | 预期表现 |
 | :--- | :--- | :--- |
 | **单卡 32GB（RTX 4080 SUPER / 5090）** 长录音高并发（带词级对齐） | `GPU_IDS=0`<br>`GPU_MEMORY_UTILIZATION=0.58`<br>`MAX_INFERENCE_BATCH_SIZE=24`<br>`ALIGNER_BATCH_SIZE=6`<br>`CHUNKS_PER_DISPATCH=6`<br>`BATCH_COALESCE_WAIT_MS=40`<br>`TEMP_DIR=/dev/shm/qwen3_asr_tmp` | 真实高密度长录音多并发约 **`120×–160×` 实时**，GPU 算力/带宽可跑满，显存峰值稳定 `~29.5–30.2 GB / 32.8 GB` |
 | **双卡 24GB（2 × RTX 4090）** 长录音高并发（带词级对齐） | `GPU_IDS=0,1`<br>`GPU_MEMORY_UTILIZATION=0.62`<br>`MAX_INFERENCE_BATCH_SIZE=16`<br>`ALIGNER_BATCH_SIZE=6`<br>`CHUNKS_PER_DISPATCH=4`<br>`BATCH_COALESCE_WAIT_MS=15` | 每张 4090 为 vLLM 留 ~14.9 GB、ForcedAligner 留 ~9.1 GB，双卡线性扩展 |
+| **单卡 24GB（NVIDIA L4 / Modal Serverless）** 闲时缩容到 0（带词级对齐） | `GPU_IDS=0`<br>`GPU_MEMORY_UTILIZATION=0.58`<br>`VLLM_MAX_MODEL_LEN=16384`<br>`MAX_INFERENCE_BATCH_SIZE=16`<br>`ALIGNER_BATCH_SIZE=6`<br>`VLLM_CUDAGRAPH_MODE=FULL_DECODE_ONLY`<br>`VLLM_CUDAGRAPH_CAPTURE_SIZES=1,2,4,8,16`<br>`WARMUP_ON_STARTUP=true` | 适配 L4 22.5 GiB 可用显存，配合 GPU 快照从 0 恢复约 `22.2s`，全功能 BF16 推理 |
 | **纯文本极速转写（不需要时间戳）** | 置空 `ALIGNER_MODEL_PATH=`<br>`GPU_MEMORY_UTILIZATION=0.88`<br>`MAX_INFERENCE_BATCH_SIZE=32` | 省去 ForcedAligner 显存与计算，吞吐再提升 ~20% |
 
 ---
 
-## 8. 运维与故障排查
+## 9. 运维与故障排查
 
 | 现象 | 排查与处理方式 |
 | :--- | :--- |

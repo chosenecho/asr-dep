@@ -132,6 +132,7 @@ flowchart TD
 │   ├── store.py           # SQLite WAL 任务持久化与过期清理
 │   └── worker.py          # 独立进程 GPU Worker（跨任务合批预取、vLLM、零梅尔等待解耦 ForcedAligner）
 ├── deploy/
+│   ├── modal_app.py       # Modal Serverless L4 部署脚本（GPU 显存快照、/cache 持久化、边缘代理鉴权）
 │   └── nginx.conf         # 大文件流式上传、限流与 HTTPS 反向代理模板
 ├── docs/
 │   ├── API.md             # 完整 HTTP API 文档

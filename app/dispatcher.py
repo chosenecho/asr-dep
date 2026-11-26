@@ -22,7 +22,7 @@ from app.alignment import (
     build_segments_from_chunk,
     merge_languages,
 )
-from app.audio import ChunkSpec, compute_chunks, decode_to_wav_16k
+from app.audio import ChunkSpec, compute_chunks, decode_to_wav_16k, warmup_silero_vad
 from app.config import Settings
 from app.store import TaskStore
 from app.worker import gpu_worker_main
@@ -104,6 +104,12 @@ class DualGPUDispatcher:
                 "aligner_batch_size": self.settings.aligner_batch_size,
                 "batch_coalesce_wait_ms": self.settings.batch_coalesce_wait_ms,
                 "max_new_tokens": self.settings.max_new_tokens,
+                "vllm_max_model_len": self.settings.vllm_max_model_len,
+                "vllm_enforce_eager": self.settings.vllm_enforce_eager,
+                "vllm_cudagraph_mode": self.settings.vllm_cudagraph_mode,
+                "vllm_cudagraph_capture_sizes": self.settings.vllm_cudagraph_capture_sizes,
+                "vllm_compilation_mode": self.settings.vllm_compilation_mode,
+                "warmup_on_startup": self.settings.warmup_on_startup,
                 "use_flash_attention": self.settings.use_flash_attention,
                 "log_level": self.settings.log_level,
             }
@@ -115,6 +121,16 @@ class DualGPUDispatcher:
             )
             proc.start()
             self._workers[gpu_id] = proc
+
+        vad_warmup_task: Optional[asyncio.Task[bool]] = None
+        if (
+            self.settings.warmup_on_startup
+            and self.settings.chunk_strategy == "vad"
+            and self.settings.asr_backend != "mock"
+        ):
+            vad_warmup_task = asyncio.create_task(
+                asyncio.to_thread(warmup_silero_vad, self.settings.vad_max_workers)
+            )
 
         # Wait for all workers to finish model loading
         ready_count = 0
@@ -154,6 +170,10 @@ class DualGPUDispatcher:
                 ready_count,
                 len(gpu_ids),
             )
+
+        if vad_warmup_task is not None:
+            vad_ok = await vad_warmup_task
+            logger.info("Startup Silero VAD warmup completed (ok=%s).", vad_ok)
 
         self._reader_thread = threading.Thread(
             target=self._result_reader_loop,

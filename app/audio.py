@@ -372,6 +372,23 @@ def _detect_speech_with_silero(
     )
 
 
+def warmup_silero_vad(max_workers: int = 1) -> bool:
+    """Preload and run a tiny Silero VAD ONNX inference on the VAD executor pool."""
+    dummy = np.zeros(1600, dtype=np.float32)  # 0.1s at 16kHz
+    try:
+        # Warm the calling thread as well as worker threads used by long-audio chunking.
+        res = _detect_speech_with_silero(dummy, SAMPLE_RATE)
+        workers = max(1, int(max_workers))
+        pool = _get_vad_executor(workers)
+        futs = [pool.submit(_detect_speech_with_silero, dummy, SAMPLE_RATE) for _ in range(workers)]
+        for fut in futs:
+            fut.result()
+        return res is not None
+    except Exception as exc:
+        logger.warning("Silero VAD warmup failed (%s); will lazily initialize on demand.", exc)
+        return False
+
+
 def _find_low_energy_offset(seg: np.ndarray, win: int) -> int:
     """Return frame offset inside `seg` with lowest sliding-window energy."""
     n = len(seg)
