@@ -372,6 +372,8 @@ class Qwen3ASRServer:
                 "CHUNK_STRATEGY": "vad",
                 "VAD_MAX_WORKERS": "4",
                 "MAX_CONCURRENT_DECODES": "4",
+                # Ephemeral containers cannot promise durable asynchronous jobs.
+                "ENABLE_ASYNC_TASKS": "false",
                 "DATA_DIR": "/tmp/qwen3_asr_data",
                 "TEMP_DIR": "/tmp/qwen3_asr_tmp",
                 "WORKER_STARTUP_TIMEOUT_SEC": "480",

@@ -34,7 +34,7 @@ class TranscriptionResultSchema(BaseModel):
 
 class TaskStatusSchema(BaseModel):
     task_id: str
-    status: str = Field(description="queued | decoding | processing | completed | failed")
+    status: str = Field(description="queued | decoding | processing | cancelling | cancelled | completed | failed")
     filename: Optional[str] = None
     duration_sec: Optional[float] = None
     total_chunks: int = 0
@@ -47,6 +47,9 @@ class TaskStatusSchema(BaseModel):
     updated_at: float
     completed_at: Optional[float] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    cancel_requested_at: Optional[float] = None
+    deadline_at: Optional[float] = None
     result: Optional[TranscriptionResultSchema] = None
 
 
@@ -54,6 +57,8 @@ class WorkerStatusSchema(BaseModel):
     gpu_id: str
     pid: Optional[int] = None
     alive: bool
+    ready: bool = False
+    generation: int = 0
 
 
 class HealthResponseSchema(BaseModel):
@@ -64,6 +69,13 @@ class HealthResponseSchema(BaseModel):
     workers: List[WorkerStatusSchema]
     inflight_batches: int
     active_background_jobs: int
+    active_jobs: int = 0
+    waiting_jobs: int = 0
+    decoding_jobs: int = 0
+    reserved_temp_bytes: int = 0
+    worker_restarts: int = 0
+    readiness: bool = False
+    unreclaimed_jobs: int = 0
 
 
 class OpenAIModelItem(BaseModel):

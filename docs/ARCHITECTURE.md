@@ -13,14 +13,18 @@ flowchart TD
 
     subgraph Core["FastAPI 服务进程"]
         Auth["API Key 鉴权 (Bearer / X-API-Key)"]
-        Store["TaskStore (SQLite WAL 持久化)"]
+        Admit["AdmissionController (作业 / 存储配额)"]
+        Jobs["JobCoordinator (截止时间 / 取消 / 所有权)"]
+        Store["TaskStore (单数据库线程 / SQLite WAL)"]
         Audio["流式落盘 -> 限流 ffmpeg 16k WAV (可选 /dev/shm) -> 无 GIL 批量 ONNX Silero VAD 切分"]
         Sched["DualGPUDispatcher (公平轮转 _job_ring + 背压水位控制)"]
         Align["Alignment 句级时间戳重建 & SRT/VTT 导出"]
     end
 
-    API --> Auth --> Audio --> Sched
-    Sched <--> Store
+    API --> Auth --> Jobs
+    Jobs --> Admit
+    Jobs --> Audio --> Sched
+    Jobs <--> Store
     Sched --> Align
 
     subgraph Workers["每卡独立 spawn Worker 进程 (数据并行，支持 1~N 卡)"]
@@ -67,7 +71,17 @@ flowchart TD
    - **响度自适应（只用于 VAD 副本）**：`normalize_for_vad` 在切分窗口的临时副本上去除直流偏置并做有界 RMS 归一化（目标 RMS `0.08`，增益限制 `[0.1, 30.0]`，纯静音 `< 1e-5` 不放大），确保极小声（如 -45 dBFS）和极大声录音都能落入 Silero VAD 最佳工作区间，**绝不修改送入 ASR 的原始音频**。
    - **无 GIL 批量 ONNX C++ 推理**：因为相邻候选窗口（如 `[105s, 135s]` 与 `[225s, 255s]`）互不重叠，`_detect_speech_batch_onnx` 将多个窗口打包为连续 NumPy 批量张量 `[M, 512]` 直接送入线程本地（`threading.local()`）的 `onnxruntime.InferenceSession` 执行；完全绕开 PyTorch 逐帧 Python 循环与 GIL 竞争，20 分钟录音切分从 `3.72s` 降至 **`0.90s`**（4.1× 提速），多并发任务在多核上彻底无锁并行。
    - **100% 无损帧连续**：优先落点在语音间隙（≥150ms 非语音停顿）的中央 60% 区域最低能量处，绝不裁切或丢弃任何静音/语音帧；若环境未安装 `silero-vad` 或整窗无停顿，自动回退到低能量谷底算法。
-4. **自动清理**：无论同步还是异步任务，均在 `finally` 中删除原始上传文件与临时 16k WAV。
+4. **资源所有权与清理**：三个上传入口先由 ASGI 中间件限制请求体和 multipart 并发，再由 `JobCoordinator` 取得统一作业票据。`AudioPreparation` 在独立的 `job_<uuid>` 目录保存源文件，解码前预留有界 PCM 输出预算。ffmpeg 超时或取消后先回收进程；推理取消后等待分片读取线程和 Worker 确认结束，超出宽限则回收相关 Worker 进程树，然后删除文件、归还票据。回收失败保留文件与配额并停止新准入，防止仍在读取的 WAV 被提前删除。
+
+### 3.1 生命周期与故障边界
+
+`JobCoordinator` 在上传暂存、SQLite 提交阶段就登记所有权；关闭服务会取消并等待这些操作。取消提交不会中断已在线程内执行的事务：先等待事务完成，再将提交成功的任务终结为取消。异步任务的完成、取消、失败通过条件更新争夺终态；重启后未完成任务标记 `SERVER_RESTARTED`，受管 UUID 目录内的孤儿音频在启动时回收。
+
+`TaskStore` 的启动、事务迁移、读写与关闭都通过一个专用执行器线程，避免阻塞事件循环；`PRAGMA user_version=1` 迁移增加 `error_code`、`cancel_requested_at`、`deadline_at`，没有增加表。列表 SQL 只选元数据，完整结果由单任务查询读取。
+
+`BatchRequest / BatchStarted / BatchResult / BatchSkipped / PrefetchFailed` 集中定义在 `app/worker_protocol.py`。每个 Worker 使用独立输入/输出队列；批次由 `batch_id + attempt + worker_generation` 标识，领取时立即确认。监控分别检查领取前的队列期限、领取后的执行期限、进程存活和启动就绪期限。旧代与重复结果被丢弃；故障批次失败，Worker 在有限预算内退避重建，不跨 Worker 重放推理。跨任务 Super-Batch 的同 Worker 逐项隔离仍保留。
+
+Linux Worker 创建独立会话，回收使用进程组并检查组内进程退出。Windows 使用 Worker 的 terminate/kill；真实后端额外创建的后代进程需要部署进程监督。当前 CPU/mock 测试验证父 Worker 回收、故障清算、重复取消和分片线程等待；Linux/vLLM 进程组继承需在实际部署验收。
 
 ---
 
@@ -122,11 +136,15 @@ flowchart TD
 .
 ├── app/
 │   ├── __init__.py
+│   ├── admission.py       # 统一作业票据与临时存储预算
+│   ├── audio_pipeline.py  # 音频准备、解码许可、文件所有权
+│   ├── jobs.py            # 同步/异步作业、取消、截止时间与 Webhook
+│   ├── worker_protocol.py # 类型化批次与故障消息
 │   ├── alignment.py       # 句级时间戳重建、语种合并、SRT/VTT 格式化
 │   ├── audio.py           # 流式上传、限流 ffmpeg 转码、响度自适应批量 ONNX Silero VAD、批量按帧读取
 │   ├── auth.py            # Bearer / X-API-Key 常量时间比对鉴权
 │   ├── config.py          # Pydantic Settings 环境变量配置
-│   ├── dispatcher.py      # 多卡 Worker 生命周期、公平轮转调度器、限流转码、Webhook 回调
+│   ├── dispatcher.py      # 多卡 Worker 监控、故障回收、公平调度与结果聚合
 │   ├── main.py            # FastAPI 路由、SSRF 校验、OpenAI 兼容层
 │   ├── schemas.py         # 请求/响应 Pydantic 模型与 verbose_json 转换
 │   ├── store.py           # SQLite WAL 任务持久化与过期清理
@@ -142,6 +160,12 @@ flowchart TD
 │   ├── download_models.py # ModelScope / HuggingFace 模型权重下载脚本
 │   └── test_client.py     # 异步/同步 API 调用与字幕导出示例客户端
 ├── tests/
+│   ├── test_admission.py          # 容量、存储预算与票据回收
+│   ├── test_audio_pipeline.py     # 转码限额、超时、重复取消与文件清理
+│   ├── test_job_lifecycle.py      # 取消竞争、提交事务、关闭及所有权
+│   ├── test_dispatcher_failures.py # Worker 崩溃、超时、旧结果和回收
+│   ├── test_store.py              # 迁移、终态竞争与数据库线程
+│   ├── test_upload_limits.py      # 解析前限制与 multipart 临时文件清理
 │   ├── test_api_integration.py     # 双 Mock Worker 端到端与多语言并发集成测试
 │   └── test_audio_and_alignment.py # VAD/能量切分、响度归一化、批量读取、对齐与字幕单测
 ├── .env.example           # 完整环境变量配置模板

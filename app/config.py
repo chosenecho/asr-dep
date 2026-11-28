@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -184,6 +184,32 @@ class Settings(BaseSettings):
         ge=1,
         description="Max concurrent active transcription jobs",
     )
+
+    # End-to-end resource admission and execution deadlines (single API process).
+    max_queued_jobs: int = Field(default=32, ge=0)
+    max_concurrent_uploads: int = Field(default=4, ge=1)
+    max_temp_storage_mb: int = Field(default=8192, ge=1)
+    max_decoded_audio_mb: int = Field(default=1024, ge=1)
+    max_async_audio_sec: float = Field(default=28800.0, gt=0)
+    decode_timeout_sec: float = Field(default=600.0, gt=0)
+    batch_timeout_sec: float = Field(default=300.0, gt=0)
+    batch_queue_timeout_sec: float = Field(default=600.0, gt=0)
+    job_timeout_sec: float = Field(default=7200.0, gt=0)
+    worker_restart_limit: int = Field(default=3, ge=0)
+    shutdown_grace_sec: float = Field(default=30.0, gt=0)
+    enable_async_tasks: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def _validate_resource_relationships(self) -> "Settings":
+        if self.chunks_per_dispatch > self.max_inference_batch_size:
+            raise ValueError("CHUNKS_PER_DISPATCH must not exceed MAX_INFERENCE_BATCH_SIZE")
+        if self.chunk_target_sec + 2 * self.chunk_search_expand_sec > 170:
+            raise ValueError("CHUNK_TARGET_SEC + 2 * CHUNK_SEARCH_EXPAND_SEC must be <= 170")
+        if self.job_timeout_sec < max(self.batch_timeout_sec, self.batch_queue_timeout_sec):
+            raise ValueError("JOB_TIMEOUT_SEC must cover both batch execution and queue deadlines")
+        if len(self.gpu_id_list) != len(set(self.gpu_id_list)):
+            raise ValueError("GPU_IDS must not contain duplicate devices")
+        return self
 
     # Persistence & temporary files
     data_dir: Path = Field(

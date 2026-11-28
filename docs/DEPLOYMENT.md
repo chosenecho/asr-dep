@@ -102,7 +102,19 @@ cp .env.example .env
 | `MAX_CONCURRENT_DECODES` | `4` | 最大并发 `ffmpeg` 音频转码进程数（`1 ~ 32`，每进程 `-threads 2`） |
 | `MAX_UPLOAD_SIZE_MB` | `500` | 单文件最大上传体积（MB，`1 ~ 4096`）；使用 Nginx 时需同步调大 `client_max_body_size` |
 | `MAX_SYNC_AUDIO_SEC` | `600` | 同步接口允许的最大音频时长（秒，最低 `30`） |
-| `MAX_CONCURRENT_JOBS` | `16` | 后台异步任务最大同时执行数（超出则在队列中等待） |
+| `MAX_CONCURRENT_JOBS` | `16` | 同步、OpenAI、异步共用的活动作业数 |
+| `MAX_QUEUED_JOBS` | `32` | 共用等待作业名额；容量满立即返回 503 |
+| `MAX_CONCURRENT_UPLOADS` | `4` | multipart 接收和解析的并发上限 |
+| `MAX_TEMP_STORAGE_MB` | `8192` | 应用接管源文件与预留 WAV 的总预算（MB） |
+| `MAX_DECODED_AUDIO_MB` | `1024` | 单次解码 WAV 输出上限（MB） |
+| `MAX_ASYNC_AUDIO_SEC` | `28800` | 异步音频时长上限（秒，8 小时） |
+| `DECODE_TIMEOUT_SEC` | `600` | ffmpeg 执行期限（秒） |
+| `BATCH_TIMEOUT_SEC` | `300` | 批次领取后到完成的期限（秒，包含预取和推理） |
+| `BATCH_QUEUE_TIMEOUT_SEC` | `600` | 批次派发后等待领取的期限（秒） |
+| `JOB_TIMEOUT_SEC` | `7200` | 暂存、等待、解码、切分和推理共用的总期限（秒） |
+| `WORKER_RESTART_LIMIT` | `3` | 每卡运行期故障重建次数；0 为关闭重建 |
+| `SHUTDOWN_GRACE_SEC` | `30` | 取消时等待读者确认的宽限期，之后强制回收相关 Worker |
+| `ENABLE_ASYNC_TASKS` | `true` | 是否接受异步任务提交；Modal 模板固定 false |
 | `DATA_DIR` | `./data`（容器内 `/app/data`） | SQLite 任务库（`tasks.db`）与默认临时音频目录 |
 | `TEMP_DIR` | `""` | 可选：覆盖临时 WAV 目录；Linux 大内存环境推荐设为 `/dev/shm/qwen3_asr_tmp` 走内存盘零磁盘 I/O |
 | `TASK_RETENTION_HOURS` | `72` | 已完成/失败任务记录保留时长（小时），任务收尾时自动清理过期记录 |
@@ -110,7 +122,19 @@ cp .env.example .env
 
 ---
 
+### 3.4 配额、迁移与关闭约定
+
+保持 `uvicorn --workers 1`：作业、上传和存储预算是单 API 进程内的统一限制，多个主进程不会共享配额。`CHUNKS_PER_DISPATCH ≤ MAX_INFERENCE_BATCH_SIZE`、`CHUNK_TARGET_SEC + 2*CHUNK_SEARCH_EXPAND_SEC ≤ 170`、总作业期限至少覆盖任一种批次期限，重复 GPU ID 在启动配置校验时直接报错。
+
+`TEMP_DIR` 的应用预算与 Starlette multipart 临时目录分别规划；后者通常取系统 `TMPDIR`，最坏需要额外考虑 `MAX_CONCURRENT_UPLOADS × MAX_UPLOAD_SIZE_MB` 的暂存空间。使用 `/dev/shm` 时应为两处预算和模型/CPU 缓存保留内存余量。Nginx 模板的 512 MB 请求上限覆盖默认 500 MB 文件及表单开销；修改文件上限时也同步调整反向代理。
+
+升级前备份 SQLite 数据目录。启动自动执行事务迁移到 `user_version=1`，保留原任务表，仅增加三个字段；迁移失败回滚，高于当前支持的版本会中止启动。回滚旧版本前先恢复升级前备份。未结束任务在重启后标记 `SERVER_RESTARTED`，不续跑；仅清理应用生成的 `job_<uuid>` 目录，用户其他文件保留。
+
+关闭时先停止准入、取消上传暂存和待提交事务，再等待在途读者；取消宽限结束会强制回收关联 GPU Worker，因此同卡其他在途批次也可能失败。Docker 模板使用 90 秒停止宽限，需按 Worker 数、读者最慢退出时间调整，给应用完成清算留出时间。`CLEANUP_FAILED` 时保留音频与配额并使健康检查降级，待完整 Worker 回收后再删除。
+
 ## 4. Docker Compose 部署（推荐）
+
+Compose 将后端端口绑定到宿主机 `127.0.0.1`，外部访问通过可选 Nginx profile；容器内部仍监听 `0.0.0.0:8000`。GPU reservation 暴露已安装的所有 GPU，再由 `GPU_IDS` 选择 Worker 使用的卡号；单卡宿主机配置 `GPU_IDS=0` 即可。需要设备隔离时，在部署环境同时收窄容器 GPU 可见集合并核对卡号映射。
 
 ### 4.1 仅启动 API 服务
 
@@ -313,7 +337,7 @@ client = OpenAI(
 3. **持久化 JIT 编译缓存 Volume（`/cache`）**：挂载独立 Volume `qwen3-asr-cache` 到 `/cache`，将 `VLLM_CACHE_ROOT`、`TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR`、`FLASHINFER_WORKSPACE_BASE`、`CUDA_CACHE_PATH` 全部持久化并在预热完成后同步 `cache_vol.commit()`，即使换镜像或快照失效也能大幅缩短兜底冷启时间。
 4. **裁剪版 Decode-Only CUDA Graph**：开启快照时使用 `VLLM_CUDAGRAPH_MODE=FULL_DECODE_ONLY` 与 `VLLM_CUDAGRAPH_CAPTURE_SIZES=1,2,4,8,16`（仅录制 5 张小/中批 Decode 图，实测捕获仅耗时 ~2s、显存 ~0.04 GiB），兼顾快照体积与推理速度；若关闭快照（`ENABLE_GPU_SNAPSHOT = False`），自动降级为 `VLLM_ENFORCE_EAGER=true`。
 5. **原版 BF16 单卡权重 + 进程内 EngineCore**：原版 BF16 权重（约 6.2 GB）预存于同区域 Volume `qwen3-asr-weights`（`/models`），启动零公网拉取；同时设置 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 在独立 GPU Worker 内直接运行 vLLM V1 EngineCore，减少跨进程 IPC 与快照复杂度。
-6. **短窗口保活（`SCALEDOWN_WINDOW_SECONDS = 60`）**：连续调用或异步任务轮询在 60 秒窗口内复用热容器，空闲后自动缩容到 0。
+6. **短窗口保活（`SCALEDOWN_WINDOW_SECONDS = 60`）**：连续同步调用在 60 秒窗口内复用热容器，空闲后自动缩容到 0。
 
 在 NVIDIA L4 (24GB) 上使用原版 BF16 权重 + 全量 ForcedAligner 的实测耗时对比：
 
@@ -324,7 +348,7 @@ client = OpenAI(
 | **开启 GPU 显存快照从 0 唤醒恢复** | **`~22.2s`** | **相比基线提速约 `5.8×`**，直接恢复已预热显存状态 |
 | 快照恢复后首条真实音频推理（含 37 词对齐） | **`~1.6s`** | 零首次 JIT 卡顿，直接命中热内核与 Decode CUDA Graph |
 
-> **Serverless 异步任务提示**：Modal 容器内的 `/tmp/qwen3_asr_data`（SQLite 任务表）随容器缩容到 0 而回收。中短音频（≤ 600s）建议直接使用同步接口 `POST /v1/asr/transcribe` 或 `POST /v1/audio/transcriptions`；长录音使用异步接口 `POST /v1/asr/tasks` 时，请在任务完成后及时取回结果（或配合 `webhook_url` 自动推送），避免容器缩容后记录丢失。
+> **Serverless 能力约定**：Modal 模板固定 `ENABLE_ASYNC_TASKS=false`，提供同步接口 `POST /v1/asr/transcribe` 与 `POST /v1/audio/transcriptions`。异步提交在解析上传前返回 `503 / ASYNC_TASKS_DISABLED`。容器 `/tmp` 内的 SQLite 与音频是临时状态；可靠异步需要外部持久任务状态和后台执行机制，留待独立扩展。
 
 ---
 
