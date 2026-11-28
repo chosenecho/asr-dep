@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from pathlib import Path
@@ -51,7 +52,11 @@ def test_health_reports_dual_workers(api_client: TestClient) -> None:
     assert body["backend"] == "mock"
     assert len(body["workers"]) == 2
     assert {w["gpu_id"] for w in body["workers"]} == {"0", "1"}
-    assert all(w["alive"] for w in body["workers"])
+    assert all(w["alive"] and w["ready"] for w in body["workers"])
+    assert body["readiness"] is True
+    assert body["worker_restarts"] == 0
+    assert body["unreclaimed_jobs"] == 0
+    assert body["reserved_temp_bytes"] == 0
 
 
 def test_api_key_auth(api_client: TestClient) -> None:
@@ -124,10 +129,44 @@ def test_async_long_audio_task_dual_gpu_and_subtitles(api_client: TestClient) ->
     list_resp = api_client.get("/v1/asr/tasks", headers=headers)
     assert list_resp.status_code == 200
     assert any(t["task_id"] == task_id for t in list_resp.json())
+    assert all(t["result"] is None for t in list_resp.json())
+    assert api_client.post(f"/v1/asr/tasks/{task_id}/cancel", headers=headers).status_code == 409
 
     del_resp = api_client.delete(f"/v1/asr/tasks/{task_id}", headers=headers)
     assert del_resp.status_code == 200
     assert api_client.get(f"/v1/asr/tasks/{task_id}", headers=headers).status_code == 404
+
+
+def test_cancel_endpoint_auth_and_resource_reclamation(api_client: TestClient, monkeypatch) -> None:
+    headers = {"Authorization": "Bearer secret-key-1"}
+    assert api_client.post("/v1/asr/tasks/missing/cancel").status_code == 401
+    assert api_client.post("/v1/asr/tasks/missing/cancel", headers=headers).status_code == 404
+
+    async def hold_decode(prepared, max_duration_sec):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(api_client.app.state.audio, "decode", hold_decode)
+    created = api_client.post("/v1/asr/tasks", headers=headers,
+        files={"file": ("cancel.wav", _make_wav_bytes(1), "audio/wav")})
+    assert created.status_code == 202
+    task_id = created.json()["task_id"]
+    path = f"/v1/asr/tasks/{task_id}"
+    accepted = api_client.post(path + "/cancel", headers=headers)
+    assert accepted.status_code == 202
+    assert accepted.json()["status"] in {"cancelling", "cancelled"}
+
+    async def wait_for_cleanup():
+        job = api_client.app.state.jobs._jobs.get(task_id)
+        if job:
+            await asyncio.shield(job.task)
+    api_client.portal.call(wait_for_cleanup)
+    final = api_client.get(path, headers=headers).json()
+    assert final["status"] == "cancelled"
+    assert final["cancel_requested_at"] is not None
+    assert final["deadline_at"] >= final["created_at"]
+    assert api_client.post(path + "/cancel", headers=headers).status_code == 202
+    health = api_client.get("/health").json()
+    assert health["active_jobs"] == health["waiting_jobs"] == health["reserved_temp_bytes"] == 0
+    assert api_client.delete(path, headers=headers).status_code == 200
 
 
 def test_webhook_ssrf_guard(api_client: TestClient) -> None:

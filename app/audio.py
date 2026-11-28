@@ -42,7 +42,10 @@ class ChunkSpec:
     end_sec: float
 
 
-async def save_upload_file(upload: UploadFile, dest_path: Path, max_bytes: int) -> int:
+async def save_upload_file(
+    upload: UploadFile, dest_path: Path, max_bytes: int,
+    *, on_chunk: Optional[Callable[[int], None]] = None,
+) -> int:
     """Stream an UploadFile to disk while enforcing max_bytes without buffering in RAM."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -58,8 +61,10 @@ async def save_upload_file(upload: UploadFile, dest_path: Path, max_bytes: int) 
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=f"Uploaded file exceeds limit of {max_bytes // (1024 * 1024)} MB.",
                     )
+                if on_chunk is not None:
+                    on_chunk(len(chunk))
                 f.write(chunk)
-    except Exception:
+    except BaseException:
         dest_path.unlink(missing_ok=True)
         raise
     finally:
@@ -76,7 +81,8 @@ async def save_upload_file(upload: UploadFile, dest_path: Path, max_bytes: int) 
 
 def _decode_with_soundfile_fallback(src_path: Path, dst_wav_path: Path) -> float:
     """Fallback decoder using soundfile when ffmpeg is unavailable (supports WAV/FLAC/OGG)."""
-    audio, sr = sf.read(str(src_path), dtype="float32", always_2d=False)
+    with src_path.open("rb") as source:
+        audio, sr = sf.read(source.fileno(), dtype="float32", always_2d=False, closefd=False)
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim == 2:
         audio = np.mean(audio, axis=-1).astype(np.float32)
@@ -96,43 +102,108 @@ def _decode_with_soundfile_fallback(src_path: Path, dst_wav_path: Path) -> float
     return round(len(audio) / float(SAMPLE_RATE), 3)
 
 
-async def decode_to_wav_16k(src_path: Path, dst_wav_path: Path) -> float:
-    """Convert any audio/video file to 16kHz mono PCM16 WAV via ffmpeg and return duration (sec)."""
+async def decode_to_wav_16k(
+    src_path: Path, dst_wav_path: Path, *, timeout_sec: float = 600,
+    max_duration_sec: Optional[float] = None, max_output_bytes: Optional[int] = None,
+    allow_soundfile_fallback: bool = False,
+) -> float:
+    """Decode with bounded time/output; reap ffmpeg before removing its output.
+
+    The optional in-memory fallback is exclusively for mock/development callers.
+    """
     dst_wav_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin:
-        proc = await asyncio.create_subprocess_exec(
-            ffmpeg_bin,
-            "-y",
-            "-v",
-            "error",
-            "-threads",
-            "2",
-            "-i",
-            str(src_path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(SAMPLE_RATE),
-            "-c:a",
-            "pcm_s16le",
-            str(dst_wav_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            dst_wav_path.unlink(missing_ok=True)
-            err_msg = stderr.decode("utf-8", errors="replace").strip()
-            raise ValueError(f"ffmpeg failed to decode audio: {err_msg or 'unknown error'}")
-        info = sf.info(str(dst_wav_path))
-        if info.frames <= 0:
-            dst_wav_path.unlink(missing_ok=True)
-            raise ValueError("Decoded audio has zero duration.")
-        return round(info.frames / float(info.samplerate), 3)
+    proc = None
+    waiter = None
+    try:
+        if ffmpeg_bin:
+            args = [ffmpeg_bin, "-y", "-v", "error", "-threads", "2", "-i", str(src_path),
+                    "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le"]
+            if max_duration_sec is not None:
+                # Decode a detection allowance so overlong inputs fail rather than succeed truncated.
+                args.extend(["-t", str(max_duration_sec + 0.25)])
+            if max_output_bytes is not None:
+                args.extend(["-fs", str(max_output_bytes)])
+            args.append(str(dst_wav_path))
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
 
-    return await asyncio.to_thread(_decode_with_soundfile_fallback, src_path, dst_wav_path)
+            async def drain_stderr() -> bytes:
+                tail = b""
+                assert proc is not None and proc.stderr is not None
+                while True:
+                    part = await proc.stderr.read(4096)
+                    if not part:
+                        break
+                    tail = (tail + part)[-16384:]
+                await proc.wait()
+                return tail
+
+            waiter = asyncio.create_task(drain_stderr())
+            async with asyncio.timeout(timeout_sec):
+                while not waiter.done():
+                    if (max_output_bytes is not None and dst_wav_path.exists()
+                            and dst_wav_path.stat().st_size > max_output_bytes):
+                        raise ValueError("Decoded audio exceeds output byte limit.")
+                    await asyncio.wait({waiter}, timeout=0.05)
+                stderr = await waiter
+            if proc.returncode != 0:
+                raise ValueError("ffmpeg failed to decode audio: " +
+                                 (stderr.decode("utf-8", errors="replace").strip() or "unknown error"))
+        else:
+            if not allow_soundfile_fallback:
+                raise ValueError("ffmpeg is required for production audio decoding.")
+            # Inspect headers before the development-only whole-file decoder allocates memory.
+            with src_path.open("rb") as source:
+                with sf.SoundFile(source.fileno(), closefd=False) as decoded_source:
+                    source_duration = decoded_source.frames / float(decoded_source.samplerate)
+            if max_duration_sec is not None and source_duration > max_duration_sec:
+                raise ValueError("Audio duration exceeds limit.")
+            if max_output_bytes is not None and source_duration * SAMPLE_RATE * 2 + 4096 > max_output_bytes:
+                raise ValueError("Decoded audio exceeds output byte limit.")
+            # Mock inputs are small; synchronous work avoids a cancelled thread writing after cleanup.
+            _decode_with_soundfile_fallback(src_path, dst_wav_path)
+        info = sf.info(str(dst_wav_path))
+        duration = info.frames / float(info.samplerate)
+        if info.frames <= 0 or info.samplerate != SAMPLE_RATE or info.channels != 1 or info.subtype != "PCM_16":
+            raise ValueError("Decoded audio must be nonempty 16kHz mono PCM16.")
+        if max_duration_sec is not None and duration > max_duration_sec:
+            raise ValueError("Audio duration exceeds limit.")
+        # -fs can stop before EOF: touching the byte ceiling must never count as success.
+        if max_output_bytes is not None and dst_wav_path.stat().st_size >= max_output_bytes - 4096:
+            raise ValueError("Decoded audio exceeds output byte limit.")
+        return round(duration, 3)
+    except BaseException:
+        async def reap_decoder() -> None:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+            if waiter is not None:
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        # The caller can cancel again during shutdown. Keep subprocess ownership
+        # until both process exit and pipe draining finish, then preserve the
+        # original exception (including cancellation) for the job coordinator.
+        cleanup = asyncio.create_task(reap_decoder())
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        dst_wav_path.unlink(missing_ok=True)
+        raise
 
 
 def normalize_for_vad(

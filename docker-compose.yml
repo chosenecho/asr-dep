@@ -6,6 +6,8 @@ services:
     image: qwen3-asr-api:latest
     container_name: qwen3-asr-api
     restart: unless-stopped
+    # Allow API cleanup and GPU reader reclamation before Docker sends SIGKILL.
+    stop_grace_period: 90s
     env_file:
       - .env
     environment:
@@ -14,7 +16,8 @@ services:
       - DATA_DIR=/app/data
       - GPU_IDS=${GPU_IDS:-0,1}
     ports:
-      - "${PORT:-8000}:8000"
+      # Keep the backend local; the optional Nginx is the public entry point.
+      - "127.0.0.1:${PORT:-8000}:8000"
     volumes:
       - ./models:/models:ro
       - ./data:/app/data
@@ -25,7 +28,8 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0", "1"]
+              # Expose installed GPUs; GPU_IDS chooses the per-card workers.
+              count: all
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

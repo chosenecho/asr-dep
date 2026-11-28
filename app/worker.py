@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
+from app.worker_protocol import (
+    BatchRequest,
+    BatchStarted,
+    BatchResult,
+    BatchSkipped,
+    PrefetchFailed,
+)
 import logging
 import os
 import queue
@@ -146,7 +154,9 @@ def _warmup_real_model(
     )
 
     if getattr(model, "forced_aligner", None) is not None:
-        feature_extractor = getattr(getattr(model, "processor", None), "feature_extractor", None)
+        feature_extractor = getattr(
+            getattr(model, "processor", None), "feature_extractor", None
+        )
         mel = (
             _extract_single_mel_feature(feature_extractor, dummy_audio)
             if feature_extractor is not None
@@ -211,7 +221,9 @@ def _load_real_model(worker_cfg: Dict[str, Any], logger: logging.Logger) -> Any:
         if worker_cfg.get("vllm_max_model_len"):
             vllm_kwargs["max_model_len"] = int(worker_cfg["vllm_max_model_len"])
         if enforce_eager:
-            logger.info("Enabling vLLM enforce_eager=True (CUDA Graphs & torch.compile disabled).")
+            logger.info(
+                "Enabling vLLM enforce_eager=True (CUDA Graphs & torch.compile disabled)."
+            )
             vllm_kwargs["enforce_eager"] = True
         else:
             comp_cfg = _build_vllm_compilation_config(worker_cfg, logger)
@@ -328,7 +340,9 @@ def _align_chunks_safely(
             for item in aligned_res.items
         ]
 
-    def _convert_raw_items(raw_items: List[Dict[str, Any]], offset_sec: float) -> List[Dict[str, Any]]:
+    def _convert_raw_items(
+        raw_items: List[Dict[str, Any]], offset_sec: float
+    ) -> List[Dict[str, Any]]:
         return [
             {
                 "text": str(it["text"]),
@@ -446,7 +460,9 @@ def _align_chunks_safely(
                     input_texts.append(inp_txt)
                 raw_wavs = [a[0] if isinstance(a, tuple) else a for a in sub_audios]
                 fut = prep_executor.submit(_prep_cpu, raw_wavs, input_texts, sub_mels)
-                prepared_jobs.append((sub_indices, sub_audios, sub_texts, sub_langs, word_lists, fut))
+                prepared_jobs.append(
+                    (sub_indices, sub_audios, sub_texts, sub_langs, word_lists, fut)
+                )
             except Exception as prep_err:
                 logger.warning(
                     "Forced alignment template prep failed (%s); retrying sub-batch individually.",
@@ -459,7 +475,14 @@ def _align_chunks_safely(
         ts_token_id = aligner.timestamp_token_id
         ts_seg_time = aligner.timestamp_segment_time
 
-        for sub_indices, sub_audios, sub_texts, sub_langs, word_lists, fut in prepared_jobs:
+        for (
+            sub_indices,
+            sub_audios,
+            sub_texts,
+            sub_langs,
+            word_lists,
+            fut,
+        ) in prepared_jobs:
             inputs = None
             logits = None
             output_ids = None
@@ -504,7 +527,8 @@ def _align_chunks_safely(
                 per_chunk_words[idx] = _convert(aligned_res, offsets[idx])
         except Exception as batch_err:
             logger.warning(
-                "Batch forced alignment failed (%s); retrying chunks individually.", batch_err
+                "Batch forced alignment failed (%s); retrying chunks individually.",
+                batch_err,
             )
             _fallback_single(sub_indices, sub_audios, sub_texts, sub_langs)
 
@@ -553,7 +577,9 @@ def _process_mock_batch(work_item: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _process_real_superbatch(
     model: Any,
-    loaded_items: List[Tuple[Dict[str, Any], List[tuple], List[Optional[Tuple[Any, Any]]]]],
+    loaded_items: List[
+        Tuple[Dict[str, Any], List[tuple], List[Optional[Tuple[Any, Any]]]]
+    ],
     logger: logging.Logger,
     aligner_batch_size: int,
     prep_executor: ThreadPoolExecutor,
@@ -649,6 +675,10 @@ def _prefetch_loop(
     coalesce_wait_sec: float,
     feature_extractor: Any,
     logger: logging.Logger,
+    result_queue: Any = None,
+    cancelled: Any = None,
+    gpu_id: str = "",
+    generation: int = 0,
 ) -> None:
     """
     Background producer inside each GPU worker:
@@ -664,6 +694,8 @@ def _prefetch_loop(
     def _load_item(
         item: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Optional[List[tuple]], Optional[str]]:
+        if cancelled is not None and cancelled.get(item["job_id"], False):
+            return item, [], None
         if backend == "mock":
             return item, [], None
         try:
@@ -676,8 +708,18 @@ def _prefetch_loop(
         try:
             return _extract_single_mel_feature(feature_extractor, aud)
         except Exception as exc:
-            logger.debug("Precompute mel failed for chunk (%s); will compute on demand.", exc)
+            logger.debug(
+                "Precompute mel failed for chunk (%s); will compute on demand.", exc
+            )
             return None
+
+    def receive(item: Any) -> Any:
+        if item is None:
+            return None
+        if not isinstance(item, BatchRequest):
+            raise TypeError("Expected BatchRequest")
+        result_queue.put(BatchStarted(item.batch_id, item.attempt, gpu_id, generation))
+        return asdict(item)
 
     try:
         while True:
@@ -688,7 +730,7 @@ def _prefetch_loop(
                 prefetch_queue.put(None)
                 return
             else:
-                first = work_queue.get()
+                first = receive(work_queue.get())
                 if first is None:
                     prefetch_queue.put(None)
                     return
@@ -700,13 +742,13 @@ def _prefetch_loop(
             while total_chunks < max_batch:
                 try:
                     if num_workers > 1:
-                        nxt = work_queue.get_nowait()
+                        nxt = receive(work_queue.get_nowait())
                     else:
                         remaining = deadline - time.monotonic()
                         if remaining > 0.001:
-                            nxt = work_queue.get(timeout=remaining)
+                            nxt = receive(work_queue.get(timeout=remaining))
                         else:
-                            nxt = work_queue.get_nowait()
+                            nxt = receive(work_queue.get_nowait())
                 except queue.Empty:
                     break
 
@@ -723,7 +765,7 @@ def _prefetch_loop(
                     break
 
             raw_loaded: List[Tuple[Dict[str, Any], List[tuple]]] = []
-            failed_items: List[Tuple[str, str]] = []
+            failed_items: List[Tuple[Dict[str, Any], str]] = []
 
             if len(items) == 1:
                 loaded_results = [_load_item(items[0])]
@@ -732,8 +774,12 @@ def _prefetch_loop(
 
             for item, audios, err in loaded_results:
                 if err is not None or audios is None:
-                    logger.warning("Failed to preload WAV for batch %s: %s", item.get("batch_id"), err)
-                    failed_items.append((item["batch_id"], err or "WAV preload failed"))
+                    logger.warning(
+                        "Failed to preload WAV for batch %s: %s",
+                        item.get("batch_id"),
+                        err,
+                    )
+                    failed_items.append((item, err or "WAV preload failed"))
                 else:
                     raw_loaded.append((item, audios))
 
@@ -747,7 +793,9 @@ def _prefetch_loop(
                 for item, auds in raw_loaded:
                     if bool(item.get("return_timestamps", True)):
                         mel_tasks.extend(auds)
-                flat_mels = list(mel_pool.map(_extract_safe, mel_tasks)) if mel_tasks else []
+                flat_mels = (
+                    list(mel_pool.map(_extract_safe, mel_tasks)) if mel_tasks else []
+                )
                 pos = 0
                 for item, auds in raw_loaded:
                     if bool(item.get("return_timestamps", True)):
@@ -761,9 +809,56 @@ def _prefetch_loop(
                     loaded_items.append((item, auds, [None] * len(auds)))
 
             prefetch_queue.put((loaded_items, failed_items))
+    except BaseException as exc:
+        prefetch_queue.put(PrefetchFailed(str(exc)))
     finally:
         io_pool.shutdown(wait=False)
         mel_pool.shutdown(wait=False)
+
+
+def _run_real_with_isolation(
+    model: Any,
+    loaded_items: list,
+    logger: logging.Logger,
+    aligner_batch_size: int,
+    prep_executor: Any,
+    cancelled: Any,
+    emit: Any,
+) -> None:
+    """Retain local per-item isolation; never resubmit a batch to another worker."""
+
+    def infer(items: list) -> Any:
+        return _process_real_superbatch(
+            model=model,
+            loaded_items=items,
+            logger=logger,
+            aligner_batch_size=aligner_batch_size,
+            prep_executor=prep_executor,
+        )
+
+    try:
+        outputs = infer(loaded_items)
+    except Exception as exc:
+        if len(loaded_items) == 1:
+            emit(loaded_items[0][0], error=exc)
+            return
+        logger.warning(
+            "Superbatch failed; isolating %d items: %s", len(loaded_items), exc
+        )
+        for pair in loaded_items:
+            item = pair[0]
+            if cancelled.get(item["job_id"], False):
+                emit(item)
+                continue
+            try:
+                for _, chunks in infer([pair]):
+                    emit(item, chunks=chunks)
+            except Exception as single_exc:
+                emit(item, error=single_exc)
+        return
+    by_id = {item["batch_id"]: item for item, _, _ in loaded_items}
+    for bid, chunks in outputs:
+        emit(by_id[bid], chunks=chunks)
 
 
 def gpu_worker_main(
@@ -771,56 +866,79 @@ def gpu_worker_main(
     work_queue: Any,
     result_queue: Any,
     ready_queue: Any,
+    cancelled: Any = None,
 ) -> None:
-    """Entrypoint for each spawned GPU worker process."""
+    """Run in a private POSIX session; parent reaps this entire process group."""
+    if os.name == "posix":
+        os.setsid()
+    cancelled = {} if cancelled is None else cancelled
     gpu_id = str(worker_cfg["gpu_id"])
+    generation = int(worker_cfg.get("worker_generation", 0))
     backend = str(worker_cfg["asr_backend"])
     max_batch = max(1, int(worker_cfg.get("max_inference_batch_size", 16)))
     aligner_batch_size = max(1, int(worker_cfg.get("aligner_batch_size", 6)))
     num_workers = max(1, int(worker_cfg.get("num_workers", 1)))
-    coalesce_wait_sec = max(0.0, int(worker_cfg.get("batch_coalesce_wait_ms", 15)) / 1000.0)
-
+    coalesce_wait_sec = max(
+        0.0, int(worker_cfg.get("batch_coalesce_wait_ms", 15)) / 1000.0
+    )
     if backend != "mock":
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
     logging.basicConfig(
-        level=getattr(logging, str(worker_cfg.get("log_level", "INFO")).upper(), logging.INFO),
-        format=f"%(asctime)s [%(levelname)s] [gpu-worker-{gpu_id}] %(message)s",
+        level=getattr(
+            logging, str(worker_cfg.get("log_level", "INFO")).upper(), logging.INFO
+        )
     )
     logger = logging.getLogger(f"asr.worker.{gpu_id}")
-
     model = None
-    align_prep_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"gpu-{gpu_id}-alignprep")
+    align_prep_pool = ThreadPoolExecutor(
+        max_workers=3, thread_name_prefix=f"gpu-{gpu_id}-alignprep"
+    )
     try:
         if backend != "mock":
             model = _load_real_model(worker_cfg, logger)
             if bool(worker_cfg.get("warmup_on_startup", False)):
-                _warmup_real_model(
-                    model=model,
-                    aligner_batch_size=aligner_batch_size,
-                    prep_executor=align_prep_pool,
-                    logger=logger,
-                )
-        else:
-            logger.info("Mock worker initialized for GPU slot %s.", gpu_id)
-        ready_queue.put({"gpu_id": gpu_id, "status": "ready", "pid": os.getpid()})
+                _warmup_real_model(model, aligner_batch_size, align_prep_pool, logger)
+        ready_queue.put(
+            {
+                "gpu_id": gpu_id,
+                "status": "ready",
+                "pid": os.getpid(),
+                "worker_generation": generation,
+            }
+        )
     except Exception as exc:
         align_prep_pool.shutdown(wait=False)
-        logger.exception("Failed to initialize worker on GPU %s", gpu_id)
         ready_queue.put(
             {
                 "gpu_id": gpu_id,
                 "status": "error",
                 "error": f"{exc}\n{traceback.format_exc()}",
+                "worker_generation": generation,
             }
         )
         return
 
-    feature_extractor = (
-        getattr(getattr(model, "processor", None), "feature_extractor", None)
-        if model is not None
-        else None
+    def emit(item: Dict[str, Any], chunks: Any = None, error: Any = None) -> None:
+        if cancelled.get(item["job_id"], False):
+            result_queue.put(
+                BatchSkipped(item["batch_id"], item["attempt"], gpu_id, generation)
+            )
+        else:
+            result_queue.put(
+                BatchResult(
+                    item["batch_id"],
+                    item["attempt"],
+                    gpu_id,
+                    generation,
+                    error is None,
+                    chunks or [],
+                    str(error) if error is not None else None,
+                )
+            )
+
+    feature_extractor = getattr(
+        getattr(model, "processor", None), "feature_extractor", None
     )
     prefetch_queue: Any = queue.Queue(maxsize=1)
     prefetch_thread = threading.Thread(
@@ -834,123 +952,58 @@ def gpu_worker_main(
             coalesce_wait_sec,
             feature_extractor,
             logger,
+            result_queue,
+            cancelled,
+            gpu_id,
+            generation,
         ),
         name=f"gpu-{gpu_id}-prefetcher",
         daemon=True,
     )
     prefetch_thread.start()
-
     try:
         while True:
-            bundle = prefetch_queue.get()
-            if bundle is None:
-                logger.info("Received shutdown signal; exiting worker on GPU %s.", gpu_id)
-                break
-
-            loaded_items, failed_items = bundle
-            for failed_batch_id, err_msg in failed_items:
-                result_queue.put(
-                    {
-                        "batch_id": failed_batch_id,
-                        "gpu_id": gpu_id,
-                        "ok": False,
-                        "error": err_msg,
-                    }
-                )
-
-            if not loaded_items:
-                continue
-
-            if backend == "mock":
-                for work_item, _, _ in loaded_items:
-                    batch_id = work_item["batch_id"]
-                    try:
-                        chunk_results = _process_mock_batch(work_item)
-                        result_queue.put(
-                            {
-                                "batch_id": batch_id,
-                                "gpu_id": gpu_id,
-                                "ok": True,
-                                "chunks": chunk_results,
-                            }
-                        )
-                    except Exception as exc:
-                        logger.exception("Mock batch %s failed on GPU %s", batch_id, gpu_id)
-                        result_queue.put(
-                            {
-                                "batch_id": batch_id,
-                                "gpu_id": gpu_id,
-                                "ok": False,
-                                "error": str(exc),
-                            }
-                        )
-                continue
-
             try:
-                per_batch_outputs = _process_real_superbatch(
-                    model=model,
-                    loaded_items=loaded_items,
-                    logger=logger,
-                    aligner_batch_size=aligner_batch_size,
-                    prep_executor=align_prep_pool,
-                )
-                for batch_id, chunk_results in per_batch_outputs:
-                    result_queue.put(
-                        {
-                            "batch_id": batch_id,
-                            "gpu_id": gpu_id,
-                            "ok": True,
-                            "chunks": chunk_results,
-                        }
+                bundle = prefetch_queue.get(timeout=0.2)
+            except queue.Empty:
+                if not prefetch_thread.is_alive():
+                    raise RuntimeError("Prefetch thread exited without completion")
+                continue
+            if bundle is None:
+                break
+            if isinstance(bundle, PrefetchFailed):
+                raise RuntimeError(f"Prefetch failed: {bundle.error}")
+            loaded_items, failed_items = bundle
+            for item, error in failed_items:
+                emit(item, error=error)
+            active = []
+            for pair in loaded_items:
+                if cancelled.get(pair[0]["job_id"], False):
+                    emit(pair[0])
+                else:
+                    active.append(pair)
+            if not active:
+                continue
+            try:
+                if backend == "mock":
+                    for item, _, _ in active:
+                        try:
+                            emit(item, chunks=_process_mock_batch(item))
+                        except Exception as exc:
+                            emit(item, error=exc)
+                else:
+                    _run_real_with_isolation(
+                        model,
+                        active,
+                        logger,
+                        aligner_batch_size,
+                        align_prep_pool,
+                        cancelled,
+                        emit,
                     )
             except Exception as exc:
-                if len(loaded_items) == 1:
-                    batch_id = loaded_items[0][0]["batch_id"]
-                    logger.exception("Batch %s failed on GPU %s", batch_id, gpu_id)
-                    result_queue.put(
-                        {
-                            "batch_id": batch_id,
-                            "gpu_id": gpu_id,
-                            "ok": False,
-                            "error": str(exc),
-                        }
-                    )
-                else:
-                    logger.warning(
-                        "Coalesced super-batch (%d items) failed on GPU %s (%s); retrying items individually.",
-                        len(loaded_items),
-                        gpu_id,
-                        exc,
-                    )
-                    for single_pair in loaded_items:
-                        batch_id = single_pair[0]["batch_id"]
-                        try:
-                            out = _process_real_superbatch(
-                                model=model,
-                                loaded_items=[single_pair],
-                                logger=logger,
-                                aligner_batch_size=aligner_batch_size,
-                                prep_executor=align_prep_pool,
-                            )
-                            for b_id, chunk_results in out:
-                                result_queue.put(
-                                    {
-                                        "batch_id": b_id,
-                                        "gpu_id": gpu_id,
-                                        "ok": True,
-                                        "chunks": chunk_results,
-                                    }
-                                )
-                        except Exception as single_exc:
-                            logger.exception("Batch %s failed on GPU %s", batch_id, gpu_id)
-                            result_queue.put(
-                                {
-                                    "batch_id": batch_id,
-                                    "gpu_id": gpu_id,
-                                    "ok": False,
-                                    "error": str(single_exc),
-                                }
-                            )
+                for item, _, _ in active:
+                    emit(item, error=exc)
     finally:
         align_prep_pool.shutdown(wait=False)
-        prefetch_thread.join(timeout=3.0)
+        prefetch_thread.join(timeout=0.2)

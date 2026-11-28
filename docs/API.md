@@ -43,6 +43,7 @@ X-API-Key: <API_KEY>
 | `GET` | `/v1/asr/tasks` | 是 | 查询异步任务列表（支持按状态筛选） |
 | `GET` | `/v1/asr/tasks/{task_id}` | 是 | 查询异步任务进度与完整转写结果 |
 | `GET` | `/v1/asr/tasks/{task_id}/subtitle` | 是 | 导出已完成任务的 SRT / WebVTT 字幕 |
+| `POST` | `/v1/asr/tasks/{task_id}/cancel` | 是 | 请求取消并等待后台回收读者、音频与配额 |
 | `DELETE` | `/v1/asr/tasks/{task_id}` | 是 | 删除已结束的异步任务记录 |
 | `POST` | `/v1/asr/transcribe` | 是 | 短/中音频同步转写接口（支持 JSON / Text / SRT / VTT） |
 | `POST` | `/v1/audio/transcriptions` | 是 | OpenAI Whisper 兼容转写接口 |
@@ -68,7 +69,14 @@ X-API-Key: <API_KEY>
     { "gpu_id": "1", "pid": 1025, "alive": true }
   ],
   "inflight_batches": 0,
-  "active_background_jobs": 0
+  "active_background_jobs": 0,
+  "active_jobs": 0,
+  "waiting_jobs": 0,
+  "decoding_jobs": 0,
+  "reserved_temp_bytes": 0,
+  "worker_restarts": 0,
+  "readiness": true,
+  "unreclaimed_jobs": 0
 }
 ```
 
@@ -95,7 +103,7 @@ X-API-Key: <API_KEY>
 
 ## 4. 长录音异步任务 API（推荐）
 
-适用于会议录音、访谈、课程、播客等任意时长音视频文件（受 `MAX_UPLOAD_SIZE_MB` 限制，默认 500MB）。任务状态持久化在 SQLite（WAL 模式）中。
+适用于会议录音、访谈、课程、播客等长音视频文件，受上传大小、`MAX_ASYNC_AUDIO_SEC`（默认 8 小时）、解码输出大小和作业截止时间限制。任务状态持久化在 SQLite（WAL 模式）中。Modal 模板设置 `ENABLE_ASYNC_TASKS=false`，提交异步任务会在解析上传前返回 `503`，错误码为 `ASYNC_TASKS_DISABLED`。
 
 ### 4.1 `POST /v1/asr/tasks`
 
@@ -143,7 +151,7 @@ X-API-Key: <API_KEY>
 | 参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `limit` | `int` | `50` | 返回条数上限，范围 `1 ~ 200` |
-| `status` | `string` | `null` | 按状态筛选：`queued` / `decoding` / `processing` / `completed` / `failed` |
+| `status` | `string` | `null` | 按状态筛选：`queued` / `decoding` / `processing` / `cancelling` / `cancelled` / `completed` / `failed` |
 
 ### 4.3 `GET /v1/asr/tasks/{task_id}`
 
@@ -151,7 +159,11 @@ X-API-Key: <API_KEY>
 
 **任务状态流转**
 
-`queued` → `decoding`（`progress=0.02`）→ `processing`（`0.05 ~ 0.99`，按已完成切片实时推进）→ `completed`（`1.0`）或 `failed`
+`queued` → `decoding`（`progress=0.02`）→ `processing`（`0.05 ~ 0.99`，按已完成切片实时推进）→ `completed`（`1.0`）或 `failed`。
+
+活动状态可经 `cancelling` → `cancelled`。任务对象新增 `error_code`（机器可读故障码）、`cancel_requested_at`（接受取消的 Unix 时间）和 `deadline_at`（作业截止的 Unix 时间）。取消和完成采用条件更新；接受取消之后，迟到的完成结果不会覆盖取消状态。`cancelling` 表示后台仍在清理读者，完成清理后才释放文件与资源。服务重启会将未结束任务标记为 `failed / SERVER_RESTARTED`，暂不支持续跑。
+
+任务列表仅返回元数据，`result` 为 `null`；需要完整转写内容请查询单个任务。
 
 **已完成响应示例 (`200 OK`)**
 
@@ -216,7 +228,16 @@ X-API-Key: <API_KEY>
 
 ### 4.5 `DELETE /v1/asr/tasks/{task_id}`
 
-删除任务记录。仅允许删除 `completed` 或 `failed` 状态的任务；运行中的任务返回 `409 Conflict`。
+删除任务记录。仅允许删除 `completed`、`failed` 或 `cancelled` 状态的任务；运行中及 `cancelling` 状态返回 `409 Conflict`。
+
+### 4.7 `POST /v1/asr/tasks/{task_id}/cancel`
+
+无需请求体，沿用 API Key 鉴权。接受取消返回 `202 Accepted`，响应结构与单任务查询相同，状态通常为 `cancelling`；清理完成后查询得到 `cancelled`。对 `cancelling` 或 `cancelled` 重复、并发请求均幂等返回 `202`；任务不存在返回 `404`；已完成或失败返回 `409`。
+
+```bash
+curl -X POST "http://localhost:8000/v1/asr/tasks/TASK_ID/cancel" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
 
 **响应示例 (`200 OK`)**
 
@@ -289,7 +310,7 @@ X-API-Key: <API_KEY>
 若在 `POST /v1/asr/tasks` 中传入了 `webhook_url`：
 
 1. **SSRF 校验**：提交时校验协议必须为 `http` 或 `https`，且拒绝 `localhost`、回环地址、内网私有网段（如 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`）、链路本地与保留地址；非法地址直接返回 `400 Bad Request`。
-2. **回调触发**：任务进入 `completed` 或 `failed` 状态后，服务端以 `POST` 方式发送 JSON 请求到 `webhook_url`，请求体与 `GET /v1/asr/tasks/{task_id}` 的返回体完全一致。
+2. **回调触发**：任务进入 `completed`、`failed` 或 `cancelled` 状态且资源清理成功后，服务端以 `POST` 方式发送 JSON 请求到 `webhook_url`，请求体与 `GET /v1/asr/tasks/{task_id}` 的返回体完全一致。
 3. **超时与容错**：超时时间由 `WEBHOOK_TIMEOUT_SEC`（默认 15s）控制；回调失败仅记录警告日志，不影响任务状态落库。
 
 ---
@@ -327,4 +348,9 @@ X-API-Key: <API_KEY>
 | `409 Conflict` | 导出未完成任务的字幕，或尝试删除仍在运行中的任务 |
 | `413 Request Entity Too Large` | 上传文件超过 `MAX_UPLOAD_SIZE_MB`（或 Nginx `client_max_body_size`） |
 | `422 Unprocessable Entity` | 必填表单字段缺失或参数类型不合法 |
-| `503 Service Unavailable` | `/health` 检测到有 GPU Worker 未就绪或已退出 |
+| `503 Service Unavailable` | 准入、上传并发或存储预算已满（含 `Retry-After`）；Worker 不可用；异步能力关闭；健康检查未就绪 |
+| `504 Gateway Timeout` | 同步作业超过总截止时间 |
+
+异步故障在任务的 `error_code` 中报告：`JOB_TIMEOUT`、`WORKER_EXITED`、`WORKER_STARTUP_TIMEOUT`、`BATCH_TIMEOUT`、`BATCH_QUEUE_TIMEOUT`、`WORKER_UNAVAILABLE`、`INFERENCE_FAILED`、`SERVER_RESTARTED`、`CLEANUP_FAILED` 等。`CLEANUP_FAILED` 时保留可能仍被读取的音频和配额，停止新准入，健康检查返回 `503`，等待完整进程回收后再释放。
+
+三个上传入口共用限制。ASGI 层先检查声明长度，再累计实际请求体字节；为 multipart 表单预留 64 KiB 开销，文件本身仍由 `MAX_UPLOAD_SIZE_MB` 校验。框架 multipart 暂存空间需另行规划，详见部署说明。

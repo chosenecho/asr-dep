@@ -5,9 +5,8 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
-import uuid
+import asyncio
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
@@ -26,7 +25,9 @@ from fastapi import (
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.alignment import format_srt, format_vtt
-from app.audio import decode_to_wav_16k, save_upload_file
+from app.admission import AdmissionController
+from app.audio_pipeline import AudioPreparation
+from app.jobs import JobCoordinator
 from app.auth import verify_api_key
 from app.config import Settings, get_settings
 from app.dispatcher import DualGPUDispatcher
@@ -76,13 +77,99 @@ def _validate_webhook_url(webhook_url: Optional[str]) -> Optional[str]:
     return url
 
 
-def _safe_suffix(filename: Optional[str]) -> str:
-    if not filename:
-        return ".bin"
-    suffix = Path(filename).suffix.lower()
-    if suffix and len(suffix) <= 10 and suffix[1:].isalnum():
-        return suffix
-    return ".bin"
+class UploadLimitMiddleware:
+    """Bound upload concurrency and streamed bytes before multipart spooling."""
+
+    _paths = {"/v1/asr/tasks", "/v1/asr/transcribe", "/v1/audio/transcriptions"}
+
+    def __init__(self, app: Any, settings: Settings) -> None:
+        self.app = app
+        self.settings = settings
+        self.active_uploads = 0
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in self._paths:
+            await self.app(scope, receive, send)
+            return
+        if scope["path"] == "/v1/asr/tasks" and not self.settings.enable_async_tasks:
+            await JSONResponse({"detail": {"code": "ASYNC_TASKS_DISABLED", "message":
+                "This deployment provides synchronous transcription only."}}, status_code=503)(scope, receive, send)
+            return
+        limit = self.settings.max_upload_bytes + 64 * 1024
+        headers = dict(scope.get("headers", []))
+        try:
+            declared = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            await JSONResponse({"detail": "Invalid Content-Length."}, status_code=400)(scope, receive, send)
+            return
+        if declared > limit:
+            await JSONResponse({"detail": "Uploaded request exceeds size limit."}, status_code=413)(scope, receive, send)
+            return
+        if self.active_uploads >= self.settings.max_concurrent_uploads:
+            await JSONResponse({"detail": {"code": "UPLOAD_CAPACITY", "message": "Too many uploads."}},
+                               status_code=503, headers={"Retry-After": "5"})(scope, receive, send)
+            return
+        self.active_uploads += 1
+        upload_counted = True
+        received = 0
+        exceeded = False
+        cancellation: Optional[asyncio.CancelledError] = None
+        replacement = b'{"detail":"Uploaded request exceeds size limit."}'
+
+        def release_upload() -> None:
+            nonlocal upload_counted
+            if upload_counted:
+                self.active_uploads -= 1
+                upload_counted = False
+
+        scope["asr.release_upload"] = release_upload
+
+        async def guarded_receive() -> Any:
+            nonlocal received, exceeded, cancellation
+            from starlette.formparsers import MultiPartException
+            try:
+                message = await receive()
+            except asyncio.CancelledError as exc:
+                # Let Starlette close partially spooled files before propagating
+                # cancellation; its parser catches MultiPartException only.
+                cancellation = exc
+                raise MultiPartException("Upload cancelled.") from exc
+            if message["type"] == "http.disconnect":
+                # Multipart parser closes its partially spooled files on this exception.
+                raise MultiPartException("Upload disconnected.")
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    raise MultiPartException("Uploaded request exceeds size limit.")
+            return message
+
+        async def guarded_send(message: Any) -> None:
+            if cancellation is not None:
+                return
+            if exceeded:
+                if message["type"] == "http.response.start":
+                    message = {"type": "http.response.start", "status": 413, "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(replacement)).encode())]}
+                elif message["type"] == "http.response.body":
+                    if message.get("more_body", False):
+                        return
+                    message = {"type": "http.response.body", "body": replacement}
+            await send(message)
+        try:
+            await self.app(scope, guarded_receive, guarded_send)
+        finally:
+            release_upload()
+            if cancellation is not None:
+                raise cancellation
+
+
+async def _release_upload_slot(request: Request) -> None:
+    # FastAPI resolves dependencies after multipart parsing, before endpoint work.
+    callback = request.scope.get("asr.release_upload")
+    if callback:
+        callback()
 
 
 def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
@@ -96,17 +183,33 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = TaskStore(settings.db_path)
-        dispatcher = DualGPUDispatcher(settings=settings, store=store)
-        await dispatcher.start()
-        app.state.settings = settings
-        app.state.store = store
-        app.state.dispatcher = dispatcher
+        dispatcher = DualGPUDispatcher(settings=settings)
+        admission = AdmissionController(settings)
+        audio = AudioPreparation(settings, admission)
+        jobs = JobCoordinator(settings, store, dispatcher, admission, audio)
         try:
+            await store.start()
+            await dispatcher.start()
+            await jobs.start()
+            app.state.settings = settings
+            app.state.store = store
+            app.state.dispatcher = dispatcher
+            app.state.jobs = jobs
+            app.state.admission = admission
+            app.state.audio = audio
             yield
         finally:
-            await dispatcher.stop()
+            try:
+                await jobs.stop()
+            finally:
+                try:
+                    await dispatcher.stop()
+                    await jobs.release_after_dispatcher_stop()
+                finally:
+                    await store.close()
 
     app = FastAPI(
+        dependencies=[Depends(_release_upload_slot)],
         title="Qwen3-ASR-1.7B API Service",
         description=(
             "Production FastAPI service for Qwen3-ASR-1.7B + Qwen3-ForcedAligner-0.6B "
@@ -115,6 +218,8 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    app.add_middleware(UploadLimitMiddleware, settings=settings)
 
     if settings_override is not None:
         app.dependency_overrides[get_settings] = lambda: settings_override
@@ -125,16 +230,27 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
     def _get_store(request: Request) -> TaskStore:
         return request.app.state.store
 
+    def _get_jobs(request: Request) -> JobCoordinator:
+        return request.app.state.jobs
+
     # ------------------------------------------------------------------
     # Health & Models
     # ------------------------------------------------------------------
 
     @app.get("/health", response_model=HealthResponseSchema, tags=["System"])
     async def health_check(
+        request: Request,
         response: Response,
         dispatcher: DualGPUDispatcher = Depends(_get_dispatcher),
     ) -> Dict[str, Any]:
         info = dispatcher.health_info()
+        info.update(request.app.state.admission.stats())
+        info["decoding_jobs"] = request.app.state.audio.decoding_jobs
+        info["active_background_jobs"] = request.app.state.jobs.active_background_jobs
+        info["unreclaimed_jobs"] = request.app.state.jobs.unreclaimed_jobs
+        if info["unreclaimed_jobs"]:
+            info["status"] = "degraded"
+            info["readiness"] = False
         if info["status"] != "ok":
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return info
@@ -168,33 +284,12 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         return_timestamps: bool = Form(default=True, description="Enable ForcedAligner timestamps"),
         include_words: bool = Form(default=True, description="Include word/char-level timestamps in response"),
         webhook_url: Optional[str] = Form(default=None, description="Optional HTTP(S) callback URL on completion"),
-        store: TaskStore = Depends(_get_store),
-        dispatcher: DualGPUDispatcher = Depends(_get_dispatcher),
+        jobs: JobCoordinator = Depends(_get_jobs),
     ) -> Dict[str, Any]:
-        clean_webhook = _validate_webhook_url(webhook_url)
-        task_id = uuid.uuid4().hex
-        raw_path = settings.temp_audio_dir / f"{task_id}_raw{_safe_suffix(file.filename)}"
-        await save_upload_file(file, raw_path, settings.max_upload_bytes)
-
-        task_record = store.create_task(
-            task_id=task_id,
-            filename=file.filename or "audio",
-            language_requested=language,
-            context=context,
-            return_timestamps=return_timestamps,
-            include_words=include_words,
-            webhook_url=clean_webhook,
-        )
-        dispatcher.enqueue_async_job(
-            task_id=task_id,
-            raw_audio_path=raw_path,
-            language=language,
-            context=context,
-            return_timestamps=return_timestamps,
-            include_words=include_words,
-            webhook_url=clean_webhook,
-        )
-        return task_record
+        clean_webhook = await asyncio.to_thread(_validate_webhook_url, webhook_url)
+        return await jobs.submit(file, language=language, context=context,
+                                 return_timestamps=return_timestamps,
+                                 include_words=include_words, webhook_url=clean_webhook)
 
     @app.get(
         "/v1/asr/tasks",
@@ -207,7 +302,7 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         task_status: Optional[str] = Query(default=None, alias="status"),
         store: TaskStore = Depends(_get_store),
     ) -> List[Dict[str, Any]]:
-        return store.list_tasks(limit=limit, status=task_status)
+        return await store.list_tasks(limit=limit, status=task_status)
 
     @app.get(
         "/v1/asr/tasks/{task_id}",
@@ -219,7 +314,7 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         task_id: str,
         store: TaskStore = Depends(_get_store),
     ) -> Dict[str, Any]:
-        task = store.get_task(task_id)
+        task = await store.get_task(task_id)
         if not task:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
         return task
@@ -234,7 +329,7 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         format: Literal["srt", "vtt"] = Query(default="srt"),
         store: TaskStore = Depends(_get_store),
     ) -> PlainTextResponse:
-        task = store.get_task(task_id)
+        task = await store.get_task(task_id)
         if not task:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
         if task["status"] != "completed" or not task.get("result"):
@@ -262,16 +357,24 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         task_id: str,
         store: TaskStore = Depends(_get_store),
     ) -> Dict[str, Any]:
-        task = store.get_task(task_id)
+        task = await store.get_task(task_id)
         if not task:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
-        if task["status"] in ("queued", "decoding", "processing"):
+        if task["status"] in ("queued", "decoding", "processing", "cancelling"):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Cannot delete a task while it is still running.",
             )
-        store.delete_task(task_id)
+        await store.delete_task(task_id)
         return {"deleted": True, "task_id": task_id}
+
+    @app.post(
+        "/v1/asr/tasks/{task_id}/cancel", response_model=TaskStatusSchema,
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(verify_api_key)], tags=["Long-Audio Async Tasks"],
+    )
+    async def cancel_task(task_id: str, jobs: JobCoordinator = Depends(_get_jobs)) -> Dict[str, Any]:
+        return await jobs.cancel(task_id)
 
     # ------------------------------------------------------------------
     # Synchronous ASR API (Short / Medium Recordings)
@@ -290,38 +393,10 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         return_timestamps: bool = Form(default=True),
         include_words: bool = Form(default=True),
         response_format: Literal["json", "text", "srt", "vtt"] = Form(default="json"),
-        dispatcher: DualGPUDispatcher = Depends(_get_dispatcher),
+        jobs: JobCoordinator = Depends(_get_jobs),
     ) -> Response:
-        req_id = uuid.uuid4().hex
-        raw_path = settings.temp_audio_dir / f"sync_{req_id}_raw{_safe_suffix(file.filename)}"
-        wav_path = settings.temp_audio_dir / f"sync_{req_id}_16k.wav"
-        try:
-            await save_upload_file(file, raw_path, settings.max_upload_bytes)
-            try:
-                duration_sec = await decode_to_wav_16k(raw_path, wav_path)
-            except ValueError as exc:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-
-            if duration_sec > settings.max_sync_audio_sec:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        f"Audio duration ({duration_sec:.1f}s) exceeds synchronous limit "
-                        f"({settings.max_sync_audio_sec:.0f}s). Use POST /v1/asr/tasks instead."
-                    ),
-                )
-
-            result = await dispatcher.transcribe_wav_file(
-                wav_path,
-                duration_sec,
-                language=language,
-                context=context,
-                return_timestamps=return_timestamps,
-                include_words=include_words,
-            )
-        finally:
-            raw_path.unlink(missing_ok=True)
-            wav_path.unlink(missing_ok=True)
+        result = await jobs.transcribe(file, language=language, context=context,
+                                       return_timestamps=return_timestamps, include_words=include_words)
 
         if response_format == "text":
             return PlainTextResponse(result["text"])
@@ -353,43 +428,15 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         prompt: str = Form(default=""),
         response_format: Literal["json", "text", "srt", "vtt", "verbose_json"] = Form(default="json"),
         timestamp_granularities: Optional[List[str]] = Form(default=None, alias="timestamp_granularities[]"),
-        dispatcher: DualGPUDispatcher = Depends(_get_dispatcher),
+        jobs: JobCoordinator = Depends(_get_jobs),
     ) -> Response:
         del model  # Accepted for OpenAI SDK compatibility; routed to loaded Qwen3-ASR-1.7B.
         granularities = set(timestamp_granularities or [])
         need_ts = response_format in ("srt", "vtt", "verbose_json") or bool(granularities)
         need_words = ("word" in granularities) or (response_format == "verbose_json" and not granularities)
 
-        req_id = uuid.uuid4().hex
-        raw_path = settings.temp_audio_dir / f"oai_{req_id}_raw{_safe_suffix(file.filename)}"
-        wav_path = settings.temp_audio_dir / f"oai_{req_id}_16k.wav"
-        try:
-            await save_upload_file(file, raw_path, settings.max_upload_bytes)
-            try:
-                duration_sec = await decode_to_wav_16k(raw_path, wav_path)
-            except ValueError as exc:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-
-            if duration_sec > settings.max_sync_audio_sec:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        f"Audio duration ({duration_sec:.1f}s) exceeds synchronous limit "
-                        f"({settings.max_sync_audio_sec:.0f}s). Use POST /v1/asr/tasks instead."
-                    ),
-                )
-
-            result = await dispatcher.transcribe_wav_file(
-                wav_path,
-                duration_sec,
-                language=language,
-                context=prompt,
-                return_timestamps=need_ts,
-                include_words=need_words,
-            )
-        finally:
-            raw_path.unlink(missing_ok=True)
-            wav_path.unlink(missing_ok=True)
+        result = await jobs.transcribe(file, language=language, context=prompt,
+                                       return_timestamps=need_ts, include_words=need_words)
 
         if response_format == "text":
             return PlainTextResponse(result["text"])

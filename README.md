@@ -21,6 +21,7 @@
   - **Worker 跨任务动态合批**：后台预取线程自动将多个并发任务的切片与零散尾批合并为最高 `MAX_INFERENCE_BATCH_SIZE`（如 `24`）的大 Batch 一次送入 vLLM（原生保留各自 `language` 与 `context`）；
   - **ForcedAligner 显存解耦 + 预取梅尔频谱**：对齐子批大小（`ALIGNER_BATCH_SIZE`）与 vLLM 批大小解耦防止长音频峰值 OOM；预取线程在 GPU 推理上一批时并行提前计算 Whisper 128 维梅尔特征，对齐阶段零等待复用；
   - **内存盘临时音频区**：支持 `TEMP_DIR=/dev/shm/qwen3_asr_tmp` 消除临时 WAV 磁盘 I/O 延迟，任务完成后自动清理。
+- **统一资源与故障控制**：三个上传入口共用作业、解码和存储预算；支持异步任务取消、总截止时间、Worker 崩溃/超时监控及有限重建；回收 WAV 读者后再删除音频，SQLite 在专用线程执行。配置与迁移约定见 [部署指南](docs/DEPLOYMENT.md#34-配额迁移与关闭约定)。
 - **双粒度时间戳 + 字幕直出**：
   - `words`：来自 `Qwen3-ForcedAligner-0.6B` 的字/词级时间戳；
   - `segments`：自动将带标点的 ASR 文本与词级时间戳对齐，重建可读的句/子句级时间戳；
@@ -58,7 +59,7 @@
 
 ## Serverless GPU 部署（Modal，闲时自动缩容到 0）
 
-若业务属于间歇性/突发流量，不希望长期包月租卡，可直接使用仓库内置的 [deploy/modal_app.py](deploy/modal_app.py) 一键部署到 [Modal](https://modal.com)（单卡 NVIDIA L4 24GB，原版 BF16 精度，闲时 60 秒自动缩容到 0）：
+若业务属于间歇性/突发流量，不希望长期包月租卡，可使用仓库内置的 [deploy/modal_app.py](deploy/modal_app.py) 部署到 [Modal](https://modal.com)（单卡 NVIDIA L4 24GB，原版 BF16 精度，闲时 60 秒自动缩容到 0）。模板设置 `ENABLE_ASYNC_TASKS=false`，仅提供同步/OpenAI 转写；异步提交返回 `503 / ASYNC_TASKS_DISABLED`，避免把容器临时存储当作可靠后台任务：
 
 ```bash
 # 1. 安装并登录 Modal CLI
@@ -113,7 +114,7 @@ cp .env.example .env
 
 ### 3. 启动双卡服务
 ```bash
-# 仅启动 API（监听 8000 端口）
+# 仅启动 API（默认仅绑定宿主机 127.0.0.1:8000）
 docker compose up -d --build
 
 # 如需同时启动前置 Nginx 反向代理（监听 80 端口）
